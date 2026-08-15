@@ -1,0 +1,15 @@
+{
+  "name": "dsh-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop shell for DeepSeek Harness (dsh) — Tauri 2 + Node sidecar",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "sidecar:build": "node sidecar/build-sidecar.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4",
+    "@yao-pkg/pkg": "6.21.0"
+  }
+}

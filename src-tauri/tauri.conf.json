@@ -1,0 +1,54 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "dsh-desktop",
+  "version": "0.1.0",
+  "identifier": "com.dsh.desktop",
+  "build": {
+    "beforeDevCommand": "node scripts/dev-splash-server.mjs",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../src-ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DeepSeek Harness",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "visible": false
+      }
+    ],
+    "security": {}
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/alanpeng/deepseek-harness-desktop/releases/latest/download/latest.json"
+      ],
+      "pubkey": "RWRF058FtWuPaj7n/70BzKaPw0WXTOTfSPjcPNUTiuCcL658k30XFQsH",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "../sidecar/runtime": "dsh-runtime"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      },
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+# Bundle patch (top-level loader patch entry array): insert the theme plugin
+# into the profile's plugin tree. The `dsh.client` row in package.json puts it
+# on the browser roster; the host-side entry in lib/index.js is a no-op so the
+# loader can resolve the package.
+- insert:
+    - id: theme-cybergreen
+      name: dsh-theme-cybergreen

@@ -1,0 +1,24 @@
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+# src-tauri/icons/ is committed — tauri.conf.json bundle.icon depends on it
+
+# Built sidecar runtime (~400MB, produced by sidecar/build-sidecar.mjs)
+sidecar/runtime/
+sidecar/staging/
+sidecar/dist/
+
+# Signing keys — never commit (D:\secrets lives outside the repo)
+*.key
+*.key.pass
+*.key.pub
+
+# Release/build artifacts (published to GitHub Releases, not the repo)
+*.nsis.zip
+*.nsis.zip.sig
+latest.json
+
+*.log
+.DS_Store
+Thumbs.db

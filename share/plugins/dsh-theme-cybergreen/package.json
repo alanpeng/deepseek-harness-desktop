@@ -1,0 +1,26 @@
+{
+  "name": "dsh-theme-cybergreen",
+  "version": "0.1.0",
+  "description": "Cybergreen dark theme for DeepSeek Harness — near-black green background, fluorescent green brand, neon state colors. Extracted from a creator-mode session and solidified as a standard cordis bundle.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "cordis.patch.yml"],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": ["@deepseek-ai/dsh-client-ui-theme"],
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
