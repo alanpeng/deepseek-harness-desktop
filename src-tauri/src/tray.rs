@@ -1,13 +1,19 @@
-//! System tray: host status, show/hide, restart, open the data dir, quit.
+//! System tray: host status, show/hide, check updates, restart, open the data dir, quit.
 
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager};
 
 use crate::host;
+use crate::updates;
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let status = MenuItem::with_id(app, "status", "Host: 运行中", false, None::<&str>)?;
+    // Hand the status item to the update flows so they can publish live text.
+    let ustate = app.state::<updates::UpdateState>();
+    *ustate.status_item.lock().unwrap() = Some(status.clone());
+
+    let check = MenuItem::with_id(app, "check-update", "检查更新…", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重启 Host", true, None::<&str>)?;
     let open_home = MenuItem::with_id(app, "open-home", "打开 DSH Home", true, None::<&str>)?;
@@ -15,7 +21,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &separator, &toggle, &restart, &open_home, &separator, &quit],
+        &[&status, &separator, &check, &toggle, &restart, &open_home, &separator, &quit],
     )?;
 
     let _tray = TrayIconBuilder::with_id("main")
@@ -24,16 +30,18 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle" => toggle_window(app),
+            "check-update" => {
+                tauri::async_runtime::spawn(updates::check_all(app.clone(), true));
+            }
             "restart" => {
-                host::kill_host(app);
-                match host::start_host(app) {
-                    Ok(port) => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let url = format!("http://127.0.0.1:{port}").parse().unwrap();
-                            let _ = window.navigate(url);
-                            let _ = window.show();
-                        }
-                    }
+                // If an update swap is in flight, ignore the click rather than
+                // racing it (the host would come back under a new runtime).
+                let ustate = app.state::<updates::UpdateState>();
+                if ustate.lock.try_lock().is_err() {
+                    return;
+                }
+                match host::restart_host(app) {
+                    Ok(_port) => updates::set_tray_status(app, "Host: 运行中"),
                     Err(err) => {
                         eprintln!("[dsh-desktop] restart failed: {err}");
                         if let Some(window) = app.get_webview_window("main") {

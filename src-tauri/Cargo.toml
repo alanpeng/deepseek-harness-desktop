@@ -19,9 +19,13 @@ tauri-plugin-dialog = "2.7.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 minisign-verify = "0.2"
+# Same version tauri-plugin-updater compiles (0.22) — used to decode the
+# tauri-signer public key format the same way the shell updater does.
+base64 = "0.22"
 sha2 = "0.10"
 semver = "1"
 futures-util = "0.3"
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "sync"] }
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 winreg = "0.52"
 serde = { version = "1", features = ["derive"] }

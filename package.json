@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
-    "sidecar:build": "node sidecar/build-sidecar.mjs"
+    "sidecar:build": "node sidecar/build-sidecar.mjs",
+    "release:desktop": "node scripts/release-desktop.mjs",
+    "release:runtime": "node scripts/release-runtime.mjs",
+    "dev:update-server": "node scripts/dev-update-server.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",

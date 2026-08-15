@@ -2,11 +2,17 @@
 
 mod deep_link;
 mod host;
+mod runtime_update;
 mod tray;
+mod updates;
 
 use tauri::{Manager, RunEvent};
 
 fn main() {
+    // reqwest is configured with rustls-no-provider (matches the updater
+    // plugin's TLS setup); install the ring crypto provider process-wide.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
@@ -19,7 +25,12 @@ fn main() {
             }
             deep_link::activate(app);
         }))
+        // Updater config (endpoints + pubkey) lives in tauri.conf.json.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(host::HostState::default())
+        .manage(updates::UpdateState::default())
+        .manage(runtime_update::RuntimeState::default())
         .setup(|app| {
             // Keep the dshdesktop:// registration pointing at this exe.
             if let Ok(exe) = std::env::current_exe() {
@@ -46,6 +57,9 @@ fn main() {
                 }
             }
             tray::setup_tray(app.handle())?;
+            // Silent startup update check (15 s later): hot-applies a newer
+            // runtime; flags a newer shell on the tray.
+            updates::startup_auto_check(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {

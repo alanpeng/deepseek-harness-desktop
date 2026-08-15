@@ -43,6 +43,18 @@ pub fn dsh_home() -> PathBuf {
     PathBuf::from(appdata).join("dsh-desktop").join("dsh-home")
 }
 
+/// Directory holding the installed executable — Windows keeps bundle resources
+/// (`dsh-runtime/`) next to the exe. Derived from `current_exe` (not
+/// `resource_dir()`, which returns `\\?\`-verbatim-prefixed paths that break
+/// node's argv parsing).
+pub fn exe_dir() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "failed to locate executable directory".to_string())
+}
+
 /// Append host sidecar output to `%APPDATA%\dsh-desktop\dsh-home\logs\host.log`.
 /// The GUI app has no console, so this file is the only place a clean-machine
 /// failure can be inspected after the fact.
@@ -119,12 +131,7 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         // `\\?\`-verbatim-prefixed paths, and node's argv parsing breaks on
         // them (clean machine: EISDIR lstat 'C:' because `\\?\C:\...` comes
         // apart during CommandLineToArgvW-style splitting).
-        let exe_dir = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| "failed to locate executable directory".to_string())?;
-        let dir = exe_dir.join("dsh-runtime");
+        let dir = exe_dir()?.join("dsh-runtime");
         let node = dir.join("node.exe");
         if !node.exists() {
             return Err(format!(
@@ -238,4 +245,18 @@ pub fn kill_host(app: &AppHandle) {
             .status();
         let _ = child.kill();
     }
+}
+
+/// Kill, respawn, and re-navigate the window to the new host port.
+/// Shared by the tray "restart" item and the runtime hot-update swap.
+/// On failure the window is pointed at the splash error page.
+pub fn restart_host(app: &AppHandle) -> Result<u16, String> {
+    kill_host(app);
+    let port = start_host(app)?;
+    if let Some(window) = app.get_webview_window("main") {
+        let url = format!("http://127.0.0.1:{port}").parse().unwrap();
+        let _ = window.navigate(url);
+        let _ = window.show();
+    }
+    Ok(port)
 }
