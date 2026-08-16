@@ -13,8 +13,8 @@ name: auto-update-dsh
 
 on:
   schedule:
-    # 每 8 小时：00:00 / 08:00 / 16:00 UTC（北京 08:00 / 16:00 / 次日 00:00）
-    - cron: '0 */8 * * *'
+    # 每小时第 37 分（避开整点 cron 潮）；仓库 public，Actions 免费不限量
+    - cron: '37 * * * *'
   workflow_dispatch: {}
 
 permissions:
