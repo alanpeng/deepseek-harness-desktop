@@ -115,7 +115,16 @@ if (!args['upload-only']) {
   const passPath = 'D:\\secrets\\dsh-updater.key.pass'
   const pass = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
     || (existsSync(passPath) ? readFileSync(passPath, 'utf8').trim() : '')
-  execFileSync(process.execPath, [TAURI_CLI, 'signer', 'sign', '-f', keyPath, '-p', pass, GZ], { stdio: 'inherit' })
+  // The tauri CLI reads TAURI_SIGNING_PRIVATE_KEY[_PATH] from the environment
+  // itself; CI injects the key content as a secret, so both our -f argument
+  // and the env var would be active and the CLI rejects the combination
+  // ("cannot be used with"). We already pass the key location explicitly —
+  // strip both vars so the CLI only sees -f.
+  const signerEnv = { ...process.env }
+  delete signerEnv.TAURI_SIGNING_PRIVATE_KEY
+  delete signerEnv.TAURI_SIGNING_PRIVATE_KEY_PATH
+  execFileSync(process.execPath, [TAURI_CLI, 'signer', 'sign', '-f', keyPath, '-p', pass, GZ],
+    { stdio: 'inherit', env: signerEnv })
   // tauri signer writes <file>.sig as base64 of the standard minisign text on
   // a single line (that's the format the shell updater's latest.json wants).
   // The runtime updater (minisign-verify Signature::from_file) needs the
