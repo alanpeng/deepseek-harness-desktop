@@ -35,25 +35,30 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm@11
 
-      # 只看正式版：过滤掉 -dev/-rc/-beta 等 pre-release 段，取最高
-      - name: Check npm for stable dsh release
+      # 接受正式版（x.y.z）和 RC（x.y.z-rc.N），dev/alpha/beta 一律忽略；
+      # semver 顺序：正式版 > 同 base 的 rc（rc 永不盖过正式版）。
+      - name: Check npm for acceptable dsh release
         id: bump
         shell: bash
         run: |
           LATEST="$(npm view @deepseek-ai/dsh versions --json | node -e '
             const vs = JSON.parse(require("fs").readFileSync(0, "utf8"))
-            const stable = vs.filter((v) => /^\d+\.\d+\.\d+$/.test(v))
-            const cmp = (a, b) => {
-              const [x, y, z] = a.split(".").map(Number)
-              const [p, q, r] = b.split(".").map(Number)
-              return x - p || y - q || z - r
+            const ok = vs.filter((v) => /^\d+\.\d+\.\d+(-rc\.\d+)?$/.test(v))
+            const parse = (v) => {
+              const m = /^(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?$/.exec(v)
+              return [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ? Number(m[4]) : Infinity]
             }
-            stable.sort(cmp)
-            process.stdout.write(stable[stable.length - 1] || "")
+            const cmp = (a, b) => {
+              const x = parse(a), y = parse(b)
+              for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] - y[i]
+              return 0
+            }
+            ok.sort(cmp)
+            process.stdout.write(ok[ok.length - 1] || "")
           ')"
-          echo "latest stable dsh: ${LATEST:-（无正式版）}"
+          echo "latest acceptable dsh: ${LATEST:-（无正式版/rc）}"
           if [ -z "$LATEST" ]; then
-            echo "没有正式版发布，无事可做"
+            echo "没有可接受的版本发布，无事可做"
             exit 0
           fi
           CUR="$(node -p "require('./sidecar/runtime-manifest/package.json').dependencies['@deepseek-ai/dsh']")"
