@@ -139,14 +139,17 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
 
-      # runtime 工件跨仓库上传（deepseek-harness-runtime），用 GH_PAT；
-      # --skip-build 复用上一步已打包的 dist tar.gz（--upload-only 幂等）
+      # runtime 工件跨仓库上传（deepseek-harness-runtime），用 GH_PAT。
+      # --skip-build 复用上一步已打包的 dist tar.gz，但保留完整发布路径：
+      # 签名（TAURI_SIGNING_PRIVATE_KEY secret）+ 幂等创建/复用 release +
+      # 上传 3 个工件。不能用 --upload-only —— 它要求 release 已存在且
+      # 跳过签名（.minisig 不会生成），首次发布必然失败。
       - name: Release runtime artifact
         shell: bash
         run: |
           node scripts/release-runtime.mjs \
             --platform "${{ matrix.platform }}" \
-            --skip-build --upload-only
+            --skip-build
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
