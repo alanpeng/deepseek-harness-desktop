@@ -1,5 +1,7 @@
 # dsh-desktop
 
+**English** · [简体中文](README.zh-CN.md)
+
 A Tauri 2 desktop shell for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh).
 Ships the dsh web host as a bundled Node sidecar, hosts the web app in a native window, and
 self-updates **both** the shell and the bundled runtime independently.

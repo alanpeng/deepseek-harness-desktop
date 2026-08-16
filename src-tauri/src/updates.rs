@@ -85,8 +85,8 @@ fn ask(app: &AppHandle, title: &str, message: &str, yes: &str, no: &str) -> bool
     }
 }
 
-/// Non-blocking info/error dialog.
-fn info(app: &AppHandle, title: &str, message: &str, kind: MessageDialogKind) {
+/// Non-blocking info/error dialog (also used by the tray menu).
+pub fn info(app: &AppHandle, title: &str, message: &str, kind: MessageDialogKind) {
     let app2 = app.clone();
     let message = message.to_string();
     let title = title.to_string();

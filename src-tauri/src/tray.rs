@@ -5,6 +5,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Manager};
 
 use crate::host;
+use crate::runtime_update;
 use crate::updates;
 
 pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -14,6 +15,8 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     *ustate.status_item.lock().unwrap() = Some(status.clone());
 
     let check = MenuItem::with_id(app, "check-update", "检查更新…", true, None::<&str>)?;
+    let version_info = MenuItem::with_id(app, "version-info", "版本信息…", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "关于…", true, None::<&str>)?;
     let toggle = MenuItem::with_id(app, "toggle", "显示 / 隐藏", true, None::<&str>)?;
     let restart = MenuItem::with_id(app, "restart", "重启 Host", true, None::<&str>)?;
     let open_home = MenuItem::with_id(app, "open-home", "打开 DSH Home", true, None::<&str>)?;
@@ -21,7 +24,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[&status, &separator, &check, &toggle, &restart, &open_home, &separator, &quit],
+        &[&status, &separator, &check, &version_info, &about, &separator, &toggle, &restart, &open_home, &separator, &quit],
     )?;
 
     let _tray = TrayIconBuilder::with_id("main")
@@ -32,6 +35,38 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
             "toggle" => toggle_window(app),
             "check-update" => {
                 tauri::async_runtime::spawn(updates::check_all(app.clone(), true));
+            }
+            "version-info" => {
+                // Shell version + bundled dsh version + latest npm version
+                // (registry query fails fast; the dialog still shows the rest).
+                let app2 = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let shell = app2.package_info().version.to_string();
+                    let bundled = runtime_update::bundled_dsh_version(&host::exe_dir().unwrap_or_default())
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|e| format!("未知（{e}）"));
+                    let latest = match runtime_update::check_runtime_update(&app2).await {
+                        Ok(Some(v)) => v.to_string(),
+                        Ok(None) => bundled.clone(),
+                        Err(_) => "查询失败".to_string(),
+                    };
+                    updates::info(
+                        &app2,
+                        "版本信息",
+                        &format!(
+                            "桌面壳：v{shell}\n捆绑 dsh 运行时：{bundled}\nnpm 最新版本：{latest}"
+                        ),
+                        tauri_plugin_dialog::MessageDialogKind::Info,
+                    );
+                });
+            }
+            "about" => {
+                updates::info(
+                    app,
+                    "关于",
+                    "DeepSeek Harness 桌面壳（dsh-desktop）\n\n作者：Alan（peng.alan@gmail.com）\n开发工具：DeepSeek-V4-Flash + Claude Code",
+                    tauri_plugin_dialog::MessageDialogKind::Info,
+                );
             }
             "restart" => {
                 // If an update swap is in flight, ignore the click rather than
