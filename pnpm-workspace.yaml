@@ -1,2 +1,9 @@
+# Root workspace: only the desktop shell devDeps (@tauri-apps/cli, pkg).
+# No child packages (sidecar/runtime-manifest is its own workspace root).
+packages: []
+
+# pnpm 11 ignores dependency build scripts by default; esbuild's postinstall
+# only self-downloads the binary (the @esbuild/*-platform optional dep already
+# ships it), so the ignore is fine — declare it explicitly to silence prompts.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: false

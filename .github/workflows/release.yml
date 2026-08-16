@@ -85,7 +85,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Setup Node 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 24
 
@@ -94,6 +94,18 @@ jobs:
       # 在 execFileSync 下不可靠），npm -g 与本地布局一致。
       - name: Install pnpm
         run: npm install -g pnpm@11
+
+      # workspace root devDeps：release-desktop.mjs spawn
+      # node_modules/@tauri-apps/cli/tauri.js 做 tauri build —— 不装必炸。
+      # Windows 用 node 调 pnpm.mjs（与 build-sidecar 相同的解析策略）。
+      - name: Install workspace deps
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node "$APPDATA/npm/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile
+          else
+            pnpm install --frozen-lockfile
+          fi
 
       - name: Install Linux build deps
         if: matrix.os == 'ubuntu-latest'
