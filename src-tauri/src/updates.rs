@@ -49,26 +49,40 @@ pub fn set_tray_status(app: &AppHandle, text: &str) {
 fn ask(app: &AppHandle, title: &str, message: &str, yes: &str, no: &str) -> bool {
     let (tx, rx) = mpsc::channel();
     let app2 = app.clone();
-    // Own the strings: the worker thread requires 'static.
+    // Own the strings: the worker thread requires 'static. Clone into the
+    // thread; the owned copies stay alive here for the label comparison.
     let title = title.to_string();
     let message = message.to_string();
-    let yes = yes.to_string();
-    let no = no.to_string();
+    let yes_owned = yes.to_string();
+    let no_owned = no.to_string();
+    let yes_thread = yes_owned.clone();
+    let no_thread = no_owned.clone();
     std::thread::spawn(move || {
         let result = app2
             .dialog()
             .message(message)
             .title(title)
             .kind(MessageDialogKind::Info)
-            .buttons(MessageDialogButtons::YesNoCancelCustom(
-                yes.to_string(),
-                no.to_string(),
-                "取消".to_string(),
+            // Two buttons only: rfd's YesNoCancelCustom mapping proved
+            // unreliable on Windows (Yes-button click returned non-Yes).
+            // OkCancelCustom keeps an unambiguous OK path.
+            .buttons(MessageDialogButtons::OkCancelCustom(
+                yes_thread,
+                no_thread,
             ))
             .blocking_show_with_result();
         let _ = tx.send(result);
     });
-    matches!(rx.recv(), Ok(MessageDialogResult::Yes))
+    let result = rx.recv();
+    log(&format!("ask() raw result: {result:?}"));
+    // rfd returns Custom(button text) for text-customised buttons, never
+    // Ok/Yes — match on the affirmative label (verified via ask() raw log:
+    // clicking the "下载" button yields Ok(Custom("下载"))).
+    match result {
+        Ok(MessageDialogResult::Custom(t)) => t.as_str() == yes_owned.as_str(),
+        Ok(MessageDialogResult::Ok) | Ok(MessageDialogResult::Yes) => true,
+        _ => false,
+    }
 }
 
 /// Non-blocking info/error dialog.
@@ -124,12 +138,12 @@ pub async fn check_all(app: AppHandle, manual: bool) {
                     "检测到 dsh 运行时更新 {bundled} → {v}\n更新期间 Host 会短暂重启。\n\n立即更新？"
                 );
                 if ask(&app, "发现运行时更新", &msg, "立即更新", "稍后") {
-                    apply_runtime(&app, &v).await;
+                    apply_runtime(&app, &v, false).await;
                 }
             } else {
                 // Silent startup path: apply without asking.
                 log("auto-applying runtime update (startup check)");
-                apply_runtime(&app, &v).await;
+                apply_runtime(&app, &v, true).await;
             }
         }
         Ok(None) => log("runtime up to date"),
@@ -168,7 +182,9 @@ pub async fn check_all(app: AppHandle, manual: bool) {
                 "发现新版本 dsh-desktop {}\n当前版本：{}\n捆绑 dsh 运行时：{}\n\n是否下载？",
                 update.version, update.current_version, bundled
             );
-            if !ask(&app, "发现新版本", &msg, "下载", "取消") {
+            let download_now = ask(&app, "发现新版本", &msg, "下载", "取消");
+            log(&format!("shell dialog result: download_now={download_now}"));
+            if !download_now {
                 return;
             }
             set_tray_status(&app, "正在下载更新…");
@@ -186,8 +202,12 @@ pub async fn check_all(app: AppHandle, manual: bool) {
                 )
                 .await
             {
-                Ok(b) => b,
+                Ok(b) => {
+                    log(&format!("shell download finished: {} bytes", b.len()));
+                    b
+                }
                 Err(e) => {
+                    log(&format!("shell download failed: {e}"));
                     set_tray_status(&app, "Host: 运行中");
                     info(&app, "下载失败", &format!("更新下载失败：\n{e}"), MessageDialogKind::Error);
                     return;
@@ -221,12 +241,16 @@ pub async fn check_all(app: AppHandle, manual: bool) {
     }
 }
 
-async fn apply_runtime(app: &AppHandle, v: &semver::Version) {
+async fn apply_runtime(app: &AppHandle, v: &semver::Version, silent: bool) {
     match runtime_update::apply_runtime_update(app, v).await {
         Ok(()) => log("runtime update applied"),
         Err(e) => {
             log(&format!("runtime update failed: {e}"));
-            info(app, "运行时更新失败", &e, MessageDialogKind::Error);
+            // Startup auto-apply failures must not pop a dialog on an idle
+            // user — the silent path only logs (retried next launch).
+            if !silent {
+                info(app, "运行时更新失败", &e, MessageDialogKind::Error);
+            }
             set_tray_status(app, "Host: 运行中");
         }
     }

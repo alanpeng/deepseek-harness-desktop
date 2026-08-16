@@ -53,6 +53,7 @@ function fakeRegistry() {
 const server = createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`)
   const path = decodeURIComponent(url.pathname)
+  console.log(`${new Date().toISOString().slice(11, 23)} ${req.method} ${path}`)
 
   if (path === '/latest.json') {
     const file = MANIFEST || join(ROOT, 'latest.json')
