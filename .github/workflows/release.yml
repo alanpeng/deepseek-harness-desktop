@@ -80,7 +80,10 @@ jobs:
           # with a swallowed 'failed to run linuxdeploy'); glibc 2.35 also
           # makes the artifacts runnable on RHEL 9 (glibc 2.34) and the deb's
           # webkit2gtk dep resolves on both 22.04 and 24.04.
-          - { os: ubuntu-22.04, platform: linux-x86_64, bundles: deb,appimage }
+          # webkit-dev must match the release: jammy ships webkit2gtk-4.0,
+          # noble+ ships 4.1 (the 4.1 package doesn't exist on 22.04 and a
+          # single missing package fails the whole apt install).
+          - { os: ubuntu-22.04, platform: linux-x86_64, bundles: deb,appimage, webkit: libwebkit2gtk-4.0-dev }
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -117,12 +120,20 @@ jobs:
             pnpm install --frozen-lockfile
           fi
 
+      # matrix.os 是 ubuntu-22.04，这里曾误写 'ubuntu-latest' 导致该步骤
+      # 永远跳过 —— 整个 Linux 构建没有任何 GTK 依赖，gdk-sys 直接炸。
+      # webkit 包名按发行版从 matrix 取（见 matrix include 注释）。
       - name: Install Linux build deps
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.platform == 'linux-x86_64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+          sudo apt-get install -y ${{ matrix.webkit }} libappindicator3-dev \
             librsvg2-dev patchelf libgtk-3-dev libxdo-dev
+          # 提前暴露缺包问题，别等 rust 编译到一半才报 pkg-config
+          pkg-config --exists gtk+-3.0 gdk-3.0 || {
+            echo "::error::GTK dev 包未就绪: $(pkg-config --modversion gtk+-3.0 2>&1)"
+            exit 1
+          }
 
       - name: Sanity runner arch
         shell: bash
