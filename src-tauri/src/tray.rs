@@ -42,7 +42,7 @@ pub fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
                 let app2 = app.clone();
                 tauri::async_runtime::spawn(async move {
                     let shell = app2.package_info().version.to_string();
-                    let bundled = runtime_update::bundled_dsh_version(&host::exe_dir().unwrap_or_default())
+                    let bundled = runtime_update::bundled_dsh_version(&host::runtime_dir(&app2).unwrap_or_default())
                         .map(|v| v.to_string())
                         .unwrap_or_else(|e| format!("未知（{e}）"));
                     let latest = match runtime_update::check_runtime_update(&app2).await {

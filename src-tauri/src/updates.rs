@@ -127,7 +127,7 @@ pub async fn check_all(app: AppHandle, manual: bool) {
     };
 
     // ── 1. runtime channel ────────────────────────────────────────────────
-    let bundled = runtime_update::bundled_dsh_version(&host::exe_dir().unwrap_or_default())
+    let bundled = runtime_update::bundled_dsh_version(&host::runtime_dir(&app).unwrap_or_default())
         .map(|v| v.to_string())
         .unwrap_or_else(|e| format!("未知（{e}）"));
     match runtime_update::check_runtime_update(&app).await {

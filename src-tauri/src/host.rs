@@ -82,6 +82,44 @@ pub fn exe_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "failed to locate executable directory".to_string())
 }
 
+/// The ACTIVE runtime directory (`dsh-runtime/` containing node + the deploy
+/// tree), resolved per platform:
+///
+/// - Windows: bundle resources sit next to the exe (tauri-utils platform.rs);
+///   `resource_dir()` there returns `\\?\`-verbatim paths that break node's
+///   argv parsing, so derive from `current_exe`.
+/// - Linux/macOS: tauri bundles resources under `<exe>/../lib/<product>`
+///   (deb: `/usr/lib/dsh-desktop`, AppImage: `$APPDIR/usr/lib/dsh-desktop`,
+///   macOS: `.app/Contents/Resources`). The bundle dir is root-owned, so
+///   runtime self-updates land in `runtime_overlay_dir()` instead — once that
+///   overlay is populated it shadows the bundle.
+pub fn runtime_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let bundle = if cfg!(windows) {
+        exe_dir()?.join("dsh-runtime")
+    } else {
+        app.path()
+            .resource_dir()
+            .map_err(|e| e.to_string())?
+            .join("dsh-runtime")
+    };
+    if cfg!(windows) {
+        return Ok(bundle);
+    }
+    let overlay = runtime_overlay_dir();
+    if overlay.join("entry.mjs").exists() {
+        Ok(overlay)
+    } else {
+        Ok(bundle)
+    }
+}
+
+/// User-writable runtime overlay — the target of runtime self-updates on
+/// Linux/macOS, where the bundled `dsh-runtime/` is root-owned. Sits next to
+/// `dsh_home()` under the shared data root.
+pub fn runtime_overlay_dir() -> PathBuf {
+    data_root().join("dsh-desktop").join("dsh-runtime")
+}
+
 /// Append host sidecar output to `%APPDATA%\dsh-desktop\dsh-home\logs\host.log`.
 /// The GUI app has no console, so this file is the only place a clean-machine
 /// failure can be inspected after the fact.
@@ -157,8 +195,12 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         // instead of app.path().resource_dir() — that resolver returns
         // `\\?\`-verbatim-prefixed paths, and node's argv parsing breaks on
         // them (clean machine: EISDIR lstat 'C:' because `\\?\C:\...` comes
-        // apart during CommandLineToArgvW-style splitting).
-        let dir = exe_dir()?.join("dsh-runtime");
+        // apart during CommandLineToArgvW-style splitting). Linux/macOS
+        // bundle resources under `<exe>/../lib/<product>` (deb:
+        // /usr/lib/dsh-desktop, AppImage: $APPDIR/usr/lib/dsh-desktop),
+        // resolved by runtime_dir() — with the user-writable overlay
+        // shadowing the bundle once a self-update landed.
+        let dir = runtime_dir(app)?;
         let node = dir.join(NODE_BIN);
         if !node.exists() {
             return Err(format!(

@@ -83,10 +83,10 @@ fn staging_dir() -> PathBuf {
     cache.join("dsh-desktop").join("update-staging")
 }
 
-/// Bundled runtime version, read from the deployed closure's package.json.
-pub fn bundled_dsh_version(exe_dir: &Path) -> Result<semver::Version, String> {
-    let pj = exe_dir
-        .join("dsh-runtime")
+/// Runtime version, read from the ACTIVE closure's package.json (the runtime
+/// dir passed in — bundle dir on Windows, bundle-or-overlay on Linux/macOS).
+pub fn bundled_dsh_version(runtime: &Path) -> Result<semver::Version, String> {
+    let pj = runtime
         .join("node_modules")
         .join("@deepseek-ai")
         .join("dsh")
@@ -104,8 +104,8 @@ pub fn bundled_dsh_version(exe_dir: &Path) -> Result<semver::Version, String> {
 
 /// Query the npm registry; return the newest dist-tag version newer than the
 /// bundled one (prereleases included — rc.6 > rc.5 for the same family).
-pub async fn check_runtime_update(_app: &AppHandle) -> Result<Option<semver::Version>, String> {
-    let current = bundled_dsh_version(&host::exe_dir()?)?;
+pub async fn check_runtime_update(app: &AppHandle) -> Result<Option<semver::Version>, String> {
+    let current = bundled_dsh_version(&host::runtime_dir(app)?)?;
     let client = http_client(Duration::from_secs(20))?;
     let resp = client
         .get(registry_url())
@@ -226,22 +226,31 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
     .await
     .map_err(|e| format!("extract task panicked: {e}"))??;
 
-    // [10] release locks on the live runtime
-    let exe_dir = host::exe_dir()?;
-    let runtime_dir = exe_dir.join("dsh-runtime");
+    // [10] release locks on the live runtime. The swap target: the bundled
+    // dir on Windows; on Linux/macOS the bundle dir is root-owned (deb:
+    // /usr/lib/dsh-desktop, AppImage: $APPDIR/usr/lib/dsh-desktop), so the
+    // update lands in the user-writable overlay, which then shadows the
+    // bundle at next start (host::runtime_dir()).
+    let install_dir = if cfg!(windows) {
+        host::runtime_dir(app)?
+    } else {
+        host::runtime_overlay_dir()
+    };
     host::kill_host(app);
 
-    // [11] old → .bak
+    // [11] old → .bak (skipped on the first non-Windows update — no overlay
+    // exists yet; the bundled runtime stays untouched)
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let bak = exe_dir.join(format!("dsh-runtime.bak.{ts}"));
-    if rename_with_retry(&runtime_dir, &bak).is_err() {
+    let parent = install_dir.parent().unwrap_or(&install_dir);
+    let bak = parent.join(format!("dsh-runtime.bak.{ts}"));
+    if install_dir.exists() && rename_with_retry(&install_dir, &bak).is_err() {
         // still locked: one more kill pass, then give up and restore service
         host::kill_host(app);
         std::thread::sleep(Duration::from_millis(500));
-        if let Err(e2) = rename_with_retry(&runtime_dir, &bak) {
+        if let Err(e2) = rename_with_retry(&install_dir, &bak) {
             let _ = host::restart_host(app);
             return Err(format!("旧运行时仍被占用，更新中止：{e2}"));
         }
@@ -250,8 +259,8 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
     // [12] new → dsh-runtime
     let top = find_top_dir(&extracted)?;
     let new_dir = extracted.join(&top);
-    if let Err(e) = rename_with_retry(&new_dir, &runtime_dir) {
-        let _ = std::fs::rename(&bak, &runtime_dir); // restore
+    if let Err(e) = rename_with_retry(&new_dir, &install_dir) {
+        let _ = std::fs::rename(&bak, &install_dir); // restore
         let _ = host::restart_host(app);
         return Err(format!("换入新运行时失败，已回滚：{e}"));
     }
@@ -272,8 +281,8 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
         Err(e) => {
             // [E4] host failed on the new runtime: full rollback
             host::kill_host(app);
-            let _ = std::fs::remove_dir_all(&runtime_dir);
-            let _ = std::fs::rename(&bak, &runtime_dir);
+            let _ = std::fs::remove_dir_all(&install_dir);
+            let _ = std::fs::rename(&bak, &install_dir);
             let _ = host::restart_host(app);
             Err(format!("新运行时启动失败，已回滚：{e}"))
         }
