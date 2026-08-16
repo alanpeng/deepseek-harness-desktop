@@ -1,0 +1,124 @@
+# 自动跟进官方 @deepseek-ai/dsh 正式版：cron 每天检查 npm，
+# 只认无 pre-release 段的正式版（x.y.z —— dev/rc/beta 全部忽略），
+# 有新正式版 → bump runtime-manifest + 更新 lockfile → 提交 →
+# 三平台构建 runtime 资产发布到 deepseek-harness-runtime。
+# 客户端侧已有启动检查，会自动热更新到新 runtime。
+#
+# 需要的 secrets 与 release.yml 相同：
+#   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD / GH_PAT
+#
+# 手动运行：Actions → auto-update-dsh → Run workflow。
+
+name: auto-update-dsh
+
+on:
+  schedule:
+    # 每天 03:37 UTC（北京 11:37），避开整点 cron 潮
+    - cron: '37 3 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.bump.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      # 只看正式版：过滤掉 -dev/-rc/-beta 等 pre-release 段，取最高
+      - name: Check npm for stable dsh release
+        id: bump
+        shell: bash
+        run: |
+          LATEST="$(npm view @deepseek-ai/dsh versions --json | node -e '
+            const vs = JSON.parse(require("fs").readFileSync(0, "utf8"))
+            const stable = vs.filter((v) => /^\d+\.\d+\.\d+$/.test(v))
+            const cmp = (a, b) => {
+              const [x, y, z] = a.split(".").map(Number)
+              const [p, q, r] = b.split(".").map(Number)
+              return x - p || y - q || z - r
+            }
+            stable.sort(cmp)
+            process.stdout.write(stable[stable.length - 1] || "")
+          ')"
+          echo "latest stable dsh: ${LATEST:-（无正式版）}"
+          if [ -z "$LATEST" ]; then
+            echo "没有正式版发布，无事可做"
+            exit 0
+          fi
+          CUR="$(node -p "require('./sidecar/runtime-manifest/package.json').dependencies['@deepseek-ai/dsh']")"
+          if [ "$LATEST" = "$CUR" ]; then
+            echo "已是 $LATEST，无需更新"
+            exit 0
+          fi
+          echo "发现新版 $LATEST（当前 $CUR），开始 bump…"
+          # bump package.json
+          node -e 'const fs=require("fs");const p="sidecar/runtime-manifest/package.json";const j=JSON.parse(fs.readFileSync(p,"utf8"));j.dependencies["@deepseek-ai/dsh"]="'"$LATEST"'";fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")'
+          # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）
+          cd sidecar/runtime-manifest
+          node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --lockfile-only --config.confirmModulesPurge=false
+          cd ../..
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sidecar/runtime-manifest/package.json sidecar/runtime-manifest/pnpm-lock.yaml
+          git commit -m "chore(runtime): bump @deepseek-ai/dsh to $LATEST"
+          git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  # 三平台并行发布 runtime 资产（与 release.yml 的 runtime 步骤同逻辑，
+  # 只跑 runtime：不编译 shell，不需要 rust 工具链和 Linux GTK 依赖）
+  runtime:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, platform: windows-x86_64 }
+          - { os: macos-latest, platform: macos-aarch64 }
+          - { os: ubuntu-24.04, platform: linux-x86_64 }
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      # 与 release.yml 相同：Windows 上 npm -g 的 pnpm 布局随 runner
+      # 变化，用 command -v 动态解析（.cmd shim 在 execFileSync 下不可靠）
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      - name: Install workspace deps
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile
+          else
+            pnpm install --frozen-lockfile
+          fi
+
+      # build-sidecar（含 koffi musl 修剪）+ signer 签名 + 上传。
+      # 发布是幂等的：重跑同版本会删旧资产重传、复用已有 release。
+      - name: Release runtime artifact
+        shell: bash
+        run: |
+          node scripts/release-runtime.mjs \
+            --platform "${{ matrix.platform }}" \
+            --node-from-exec
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
