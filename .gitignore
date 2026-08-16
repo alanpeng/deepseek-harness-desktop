@@ -22,3 +22,6 @@ latest.json
 *.log
 .DS_Store
 Thumbs.db
+
+# Local-only MSVC toolchain pin (this machine's MSVC/SDK paths; CI has its own toolchain)
+src-tauri/.cargo/config.toml

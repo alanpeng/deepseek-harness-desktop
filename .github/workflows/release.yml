@@ -97,12 +97,13 @@ jobs:
 
       # workspace root devDeps：release-desktop.mjs spawn
       # node_modules/@tauri-apps/cli/tauri.js 做 tauri build —— 不装必炸。
-      # Windows 用 node 调 pnpm.mjs（与 build-sidecar 相同的解析策略）。
+      # Windows 上 npm -g 的安装位置随 runner 布局（%APPDATA%\npm 或
+      # hostedtoolcache node 目录旁），用 command -v 动态解析 pnpm.mjs。
       - name: Install workspace deps
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            node "$APPDATA/npm/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile
+            node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile
           else
             pnpm install --frozen-lockfile
           fi
