@@ -79,6 +79,10 @@ jobs:
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      # linuxdeploy is itself an AppImage; ubuntu-24.04 runners ship no
+      # libfuse2, so run it via extract-and-run instead of FUSE mounting.
+      # Harmless on the other platforms.
+      APPIMAGE_EXTRACT_AND_RUN: '1'
     steps:
       - uses: actions/checkout@v5
 
