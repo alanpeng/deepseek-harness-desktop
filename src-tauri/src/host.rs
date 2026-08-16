@@ -15,6 +15,34 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
 
+/// Platform node binary name inside dsh-runtime/ (shared with runtime_update).
+#[cfg(windows)]
+pub const NODE_BIN: &str = "node.exe";
+#[cfg(not(windows))]
+pub const NODE_BIN: &str = "node";
+
+/// User home directory (shared with runtime_update's data-root resolution).
+#[cfg(windows)]
+pub fn user_home() -> PathBuf {
+    PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
+}
+#[cfg(not(windows))]
+pub fn user_home() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+}
+
+/// Shared data root for dsh_home: %APPDATA% on Windows, XDG data dir elsewhere.
+#[cfg(windows)]
+pub fn data_root() -> PathBuf {
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()))
+}
+#[cfg(not(windows))]
+pub fn data_root() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| user_home().join(".local").join("share"))
+}
+
 /// Shared host state managed by Tauri.
 pub struct HostState {
     /// Port the web host was spawned on (Some once the host is up).
@@ -39,8 +67,7 @@ impl Default for HostState {
 /// install directory stays read-only and dsh keeps its self-update capability
 /// (creator mode, preset authoring, plugin install, settings).
 pub fn dsh_home() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(appdata).join("dsh-desktop").join("dsh-home")
+    data_root().join("dsh-desktop").join("dsh-home")
 }
 
 /// Directory holding the installed executable — Windows keeps bundle resources
@@ -132,7 +159,7 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         // them (clean machine: EISDIR lstat 'C:' because `\\?\C:\...` comes
         // apart during CommandLineToArgvW-style splitting).
         let dir = exe_dir()?.join("dsh-runtime");
-        let node = dir.join("node.exe");
+        let node = dir.join(NODE_BIN);
         if !node.exists() {
             return Err(format!(
                 "dsh runtime not found at {} (resources missing from install?)",
@@ -155,7 +182,7 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         ])
         .env("DSH_HOME", dsh_home().to_str().unwrap_or("."))
         .env("DSH_TELEMETRY_DISABLED", "1")
-        .current_dir(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".to_string()));
+        .current_dir(user_home());
 
     let (mut rx, child) = command.spawn().map_err(|e| e.to_string())?;
 
@@ -239,10 +266,18 @@ pub fn kill_host(app: &AppHandle) {
     let child = state.child.lock().unwrap().take();
     if let Some(child) = child {
         let pid = child.pid();
+        #[cfg(windows)]
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW — no console flash
             .status();
+        #[cfg(not(windows))]
+        {
+            // Kill children first (pkill -P), then the parent via child.kill().
+            let _ = std::process::Command::new("pkill")
+                .args(["-TERM", "-P", &pid.to_string()])
+                .status();
+        }
         let _ = child.kill();
     }
 }

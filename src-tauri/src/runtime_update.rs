@@ -37,8 +37,29 @@ impl Default for RuntimeState {
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/@deepseek-ai/dsh";
 const RELEASE_BASE: &str =
     "https://github.com/alanpeng/deepseek-harness-runtime/releases/download";
+#[cfg(windows)]
 const TAR_EXE: &str = "C:\\Windows\\System32\\tar.exe";
+#[cfg(not(windows))]
+const TAR_EXE: &str = "tar";
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Platform suffix for runtime artifacts (mirrors the release workflow matrix).
+pub fn platform_suffix() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "windows-x86_64",
+        ("macos", "x86_64") => "macos-x86_64",
+        ("macos", "aarch64") => "macos-aarch64",
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        (os, arch) => {
+            // Unknown combo: still build a stable (if wrong) URL so the check
+            // fails loudly against a 404 instead of panicking.
+            let _ = (os, arch);
+            "unknown"
+        }
+    }
+}
 
 /// Dev/test override hooks (zero production risk).
 fn registry_url() -> String {
@@ -49,9 +70,17 @@ fn artifact_base_url() -> String {
 }
 
 /// Staging dir on the same volume as the install dir (rename swap, no copy).
+#[cfg(windows)]
 fn staging_dir() -> PathBuf {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(local).join("dsh-desktop").join("update-staging")
+}
+#[cfg(not(windows))]
+fn staging_dir() -> PathBuf {
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::host::user_home().join(".cache"));
+    cache.join("dsh-desktop").join("update-staging")
 }
 
 /// Bundled runtime version, read from the deployed closure's package.json.
@@ -135,7 +164,10 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
     }
 
     let client = http_client(Duration::from_secs(300))?;
-    let tag = format!("dsh-runtime-{target}");
+    // Artifacts are per-platform: dsh-runtime-<v>-<platform> release tag,
+    // tarball + checksum + signature all carry the platform suffix.
+    let plat = platform_suffix();
+    let tag = format!("dsh-runtime-{target}-{plat}");
     let base = artifact_base_url();
     let gz_url = format!("{base}/{tag}/{tag}.tar.gz");
     let sha_url = format!("{base}/{tag}.tar.gz.sha256");
@@ -363,14 +395,16 @@ fn internal_version_matches(artifact: &Path, expected: &semver::Version) -> Resu
 fn extract_tar_gz(artifact: &Path, dest: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dest)
         .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
-    let status = std::process::Command::new(TAR_EXE)
-        .args([
-            "-xzf",
-            artifact.to_str().unwrap_or_default(),
-            "-C",
-            dest.to_str().unwrap_or_default(),
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
+    let mut cmd = std::process::Command::new(TAR_EXE);
+    cmd.args([
+        "-xzf",
+        artifact.to_str().unwrap_or_default(),
+        "-C",
+        dest.to_str().unwrap_or_default(),
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let status = cmd
         .status()
         .map_err(|e| format!("tar 解压启动失败: {e}"))?;
     if !status.success() {
@@ -391,12 +425,15 @@ fn find_top_dir(root: &Path) -> Result<String, String> {
     Err("解压结果为空目录".to_string())
 }
 
-/// The swapped-in runtime must at least have node.exe + entry.mjs.
+/// The swapped-in runtime must at least have the node binary + entry.mjs.
 fn runtime_sanity(extracted: &Path) -> Result<(), String> {
     let top = find_top_dir(extracted)?;
     let dir = extracted.join(&top);
-    if !dir.join("node.exe").exists() {
-        return Err(format!("解压后的运行时缺少 node.exe（{top}）"));
+    if !dir.join(crate::host::NODE_BIN).exists() {
+        return Err(format!(
+            "解压后的运行时缺少 {}（{top}）",
+            crate::host::NODE_BIN
+        ));
     }
     if !dir.join("entry.mjs").exists() {
         return Err(format!("解压后的运行时缺少 entry.mjs（{top}）"));
@@ -423,6 +460,7 @@ fn rename_with_retry(from: &Path, to: &Path) -> Result<(), String> {
     unreachable!()
 }
 
+#[cfg(windows)]
 fn free_space_bytes() -> Result<u64, String> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
     let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
@@ -433,6 +471,20 @@ fn free_space_bytes() -> Result<u64, String> {
         return Err("GetDiskFreeSpaceExW 失败".to_string());
     }
     Ok(free)
+}
+
+#[cfg(not(windows))]
+fn free_space_bytes() -> Result<u64, String> {
+    use std::ffi::CString;
+    let cache = std::env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| crate::host::user_home().join(".cache").to_string_lossy().into_owned());
+    let root = CString::new(cache).map_err(|e| e.to_string())?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(root.as_ptr(), &mut st) };
+    if rc != 0 {
+        return Err("statvfs 失败".to_string());
+    }
+    Ok(st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 /// Same keypair as the shell updater — single source of truth.

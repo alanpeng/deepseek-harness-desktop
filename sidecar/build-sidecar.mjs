@@ -5,9 +5,11 @@
 //   1. `pnpm deploy` materializes the desktop-runtime closure manifest
 //      (packages/desktop/desktop-runtime in the dsh clone) into a flat
 //      hoisted node_modules tree — no devDeps, peers listed explicitly.
-//   2. Assemble `sidecar/runtime/`: the deploy tree + a stock Node 24 exe.
+//   2. Assemble `sidecar/runtime/`: the deploy tree + a stock Node binary.
 //      Tauri's `bundle.resources` ships this directory inside the installer
-//      as `dsh-runtime`, and the app spawns `node.exe entry.mjs` from there.
+//      as `dsh-runtime`, and the app spawns `node entry.mjs` from there.
+//   3. Pack `sidecar/dist/dsh-runtime-<v>-<platform>.tar.gz` (top-level
+//      `runtime/`, same layout the runtime updater ships).
 //
 // Why a directory instead of a single packaged exe: dsh is a cordis plugin
 // host whose loader resolves plugins by name at runtime (dynamic import), and
@@ -18,45 +20,112 @@
 // machines, absent on clean installs). Running stock node against a bundled
 // tree behaves exactly like dev and supports everything dsh needs (ESM,
 // dynamic imports, native modules like sharp / node-pty).
+//
+// Usage:
+//   node sidecar/build-sidecar.mjs [--platform windows-x86_64]
+//                                  [--node-from-exec] [--clone <dsh clone dir>]
+//   --platform        windows-x86_64 (default) | macos-x86_64 |
+//                     macos-aarch64 | linux-x86_64
+//   --node-from-exec  copy process.execPath as the bundled node binary
+//                     (CI: run after setup-node so the version is correct
+//                     and no download is needed). Without it, Windows uses
+//                     the well-known install path and other platforms fall
+//                     back to execPath too.
+//   --clone           dsh clone directory (CI checks out the runtime repo
+//                     separately). Defaults to ../deepseek-harness.
 
 import { execFileSync, spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)) // dsh-desktop/
-const CLONE = resolve(ROOT, '..', 'deepseek-harness')
+const args = parseArgs(process.argv.slice(2))
+const PLATFORM = args.platform || 'windows-x86_64'
+const CLONE = resolve(args.clone || join(ROOT, '..', 'deepseek-harness'))
 const RUNTIME_PKG = 'packages/desktop/desktop-runtime'
 const STAGING = join(ROOT, 'sidecar', 'staging')
 const RUNTIME_DIR = join(STAGING, 'dsh-desktop-runtime') // pnpm deploy names the target after the package
 const RUNTIME_OUT = join(ROOT, 'sidecar', 'runtime') // what the installer ships as dsh-runtime
-const NODE_EXE = 'C:\\Program Files\\nodejs\\node.exe' // stock Node 24, same family the dev flow uses
+const DIST = join(ROOT, 'sidecar', 'dist')
+
+// Per-platform facts: bundled node binary name, whether the NSIS MAX_PATH
+// trim applies (only Windows installers hit makensis' path limit).
+const PLATFORMS = {
+  'windows-x86_64': { node: 'node.exe', trimDeepPaths: true },
+  'macos-x86_64': { node: 'node', trimDeepPaths: false },
+  'macos-aarch64': { node: 'node', trimDeepPaths: false },
+  'linux-x86_64': { node: 'node', trimDeepPaths: false },
+}
+if (!PLATFORMS[PLATFORM]) fail(`未知平台 ${PLATFORM}（可用: ${Object.keys(PLATFORMS).join(', ')}）`)
+
+// Archive tool: libarchive bsdtar ships as tar.exe with Windows, `tar` on unix.
+const TAR = process.platform === 'win32' ? 'C:\\Windows\\System32\\tar.exe' : 'tar'
 
 // Windows: never spawn `pnpm` by bare name — under Git Bash the PATH
 // entries are POSIX shell scripts that CreateProcess refuses (EINVAL), and
 // the .cmd shims are equally unreliable through execFileSync. Invoke the real
-// JS entry via the current node instead.
+// JS entry via the current node instead. On unix, pnpm is a plain executable
+// on PATH (corepack / pnpm install) and execFileSync handles it directly.
 const NODE = process.execPath
-const PNPM_ENTRY = join(process.env.APPDATA, 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
+const PNPM_ENTRY = process.platform === 'win32'
+  ? join(process.env.APPDATA, 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
+  : 'pnpm'
 
-function requireEntry(entry, what) {
-  if (!existsSync(entry)) throw new Error(`${what} entry not found at ${entry}`)
-  return entry
+function fail(msg) {
+  console.error(`[build-sidecar] ${msg}`)
+  process.exit(1)
+}
+
+function parseArgs(argv) {
+  const out = {}
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    if (a.startsWith('--')) {
+      const key = a.slice(2)
+      const next = argv[i + 1]
+      if (next && !next.startsWith('--')) { out[key] = next; i++ } else out[key] = true
+    }
+  }
+  return out
 }
 
 function run(args, opts = {}) {
-  console.log(`\n$ node ${args.join(' ')}`)
-  execFileSync(NODE, args, { stdio: 'inherit', ...opts })
+  // unix: pnpm is a real executable on PATH; Windows: invoke pnpm.mjs via node.
+  const cmd = process.platform === 'win32' ? NODE : PNPM_ENTRY
+  const argv = process.platform === 'win32' ? [PNPM_ENTRY, ...args] : args
+  console.log(`\n$ ${process.platform === 'win32' ? 'node' : 'pnpm'} ${args.join(' ')}`)
+  execFileSync(cmd, argv, { stdio: 'inherit', ...opts })
+}
+
+// The bundled node binary. CI passes --node-from-exec (setup-node 24 already
+// put the right binary on PATH). Locally: the well-known Windows install path
+// (existing behavior) or — on unix — whatever node this script runs under.
+function resolveNodeBinary() {
+  const target = join(RUNTIME_OUT, PLATFORMS[PLATFORM].node)
+  if (args['node-from-exec']) {
+    if (!existsSync(process.execPath)) fail(`execPath not found: ${process.execPath}`)
+    console.log(`  node from execPath: ${process.execPath}`)
+    return process.execPath
+  }
+  if (PLATFORM === 'windows-x86_64') {
+    const exe = 'C:\\Program Files\\nodejs\\node.exe'
+    if (!existsSync(exe)) throw new Error(`node.exe not found at ${exe}`)
+    return exe
+  }
+  // unix local build: this script IS running on node, so execPath is the
+  // binary (no symlink indirection, unlike `which node`).
+  return process.execPath
 }
 
 // ── 1. deploy the closure ────────────────────────────────────────────────
-console.log('[1/3] Deploying desktop-runtime closure')
+console.log(`[1/4] Deploying desktop-runtime closure (platform ${PLATFORM})`)
 rmSync(STAGING, { recursive: true, force: true })
 mkdirSync(STAGING, { recursive: true })
 // pnpm 11 deploy: `--filter=<package name>` selects the project, `--legacy`
 // opts out of the injected-workspace requirement (this workspace does not set
 // inject-workspace-packages), the target dir is the only positional arg.
-run([requireEntry(PNPM_ENTRY, 'pnpm'), '--dir', CLONE,
+run(['--dir', CLONE,
   '--filter=dsh-desktop-runtime',
   'deploy',
   '--legacy',
@@ -119,28 +188,56 @@ function checkClosure(root) {
 }
 
 // ── 2. assemble the runtime dir ──────────────────────────────────────────
-console.log('[2/3] Assembling runtime dir')
+console.log('[2/4] Assembling runtime dir')
 rmSync(RUNTIME_OUT, { recursive: true, force: true })
 mkdirSync(RUNTIME_OUT, { recursive: true })
-if (!existsSync(NODE_EXE)) throw new Error(`node.exe not found at ${NODE_EXE}`)
-cpSync(NODE_EXE, join(RUNTIME_OUT, 'node.exe'))
-// cpSync of 200MB+ of node_modules through the JS fallback is slow; robocopy
-// threads it. Robocopy exit codes 0-7 are all success (1 = files copied).
-const rc = spawnSync('robocopy', [RUNTIME_DIR, RUNTIME_OUT, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS'],
-  { stdio: 'inherit' })
-if (rc.status === null || rc.status > 7) throw new Error(`robocopy failed with exit code ${rc.status}`)
+const nodeSrc = resolveNodeBinary()
+const nodeTarget = join(RUNTIME_OUT, PLATFORMS[PLATFORM].node)
+cpSync(nodeSrc, nodeTarget)
+console.log(`  bundled ${nodeSrc} -> ${nodeTarget}`)
+if (process.platform === 'win32') {
+  // robocopy threads the 200MB+ node_modules copy; exit codes 0-7 are all
+  // success (1 = files copied).
+  const rc = spawnSync('robocopy', [RUNTIME_DIR, RUNTIME_OUT, '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/NC', '/NS'],
+    { stdio: 'inherit' })
+  if (rc.status === null || rc.status > 7) throw new Error(`robocopy failed with exit code ${rc.status}`)
+} else {
+  // unix has no robocopy — plain recursive copy. Not hosted by CI (pnpm
+  // deploy + copies of this tree are genuinely cheap; robocopy exists here
+  // only because Windows' single-threaded cpSync was measurably slow).
+  cpSync(RUNTIME_DIR, RUNTIME_OUT, { recursive: true })
+}
 
 // makensis enforces the Win32 MAX_PATH limit: pi-ai's nested copy of
 // @mistralai/mistralai (esm/models/operations/<operation>.d.ts) blows past
 // 260 chars and aborts the installer with "failed opening file". mistralai is
 // a lazy/optional dep of pi-ai (checkClosure above only flags @deepseek-ai/*
-// as hard requirements), so drop it before the bundler sees it.
-const piAiNested = join(RUNTIME_OUT, 'node_modules', '@earendil-works', 'pi-ai', 'node_modules')
-const piMistral = join(piAiNested, '@mistralai')
-if (existsSync(piMistral)) {
-  rmSync(piMistral, { recursive: true, force: true })
-  console.log(`  pruned ${piMistral} (NSIS MAX_PATH)`)
+// as hard requirements), so drop it before the bundler sees it. Only the
+// Windows NSIS path hits this — dmg/deb/AppImage tools have no 260-char limit.
+if (PLATFORMS[PLATFORM].trimDeepPaths) {
+  const piAiNested = join(RUNTIME_OUT, 'node_modules', '@earendil-works', 'pi-ai', 'node_modules')
+  const piMistral = join(piAiNested, '@mistralai')
+  if (existsSync(piMistral)) {
+    rmSync(piMistral, { recursive: true, force: true })
+    console.log(`  pruned ${piMistral} (NSIS MAX_PATH)`)
+  }
 }
 
-// ── 3. report ────────────────────────────────────────────────────────────
-console.log(`[3/3] Done: ${RUNTIME_OUT} (node_modules deployed, node.exe embedded)`)
+// ── 3. pack the artifact ─────────────────────────────────────────────────
+console.log('[3/4] Packing tarball')
+const pjPath = join(RUNTIME_OUT, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
+if (!existsSync(pjPath)) fail(`dsh package.json not found at ${pjPath}`)
+const VERSION = JSON.parse(readFileSync(pjPath, 'utf8')).version
+if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(VERSION)) fail(`bad dsh version: ${VERSION}`)
+const TAG = `dsh-runtime-${VERSION}-${PLATFORM}`
+mkdirSync(DIST, { recursive: true })
+const GZ = join(DIST, `${TAG}.tar.gz`)
+rmSync(GZ, { force: true })
+// Top-level dir is `runtime/` (the app resolves it via find_top_dir).
+const rc = spawnSync(TAR, ['-czf', GZ, '-C', join(ROOT, 'sidecar'), 'runtime'], { stdio: 'inherit' })
+if (rc.status !== 0) fail(`tar pack failed (exit ${rc.status})`)
+const gzMB = Math.round(statSync(GZ).size / 1048576)
+
+// ── 4. report ────────────────────────────────────────────────────────────
+console.log(`[4/4] Done: ${RUNTIME_OUT} (dsh ${VERSION}, ${PLATFORM})`)
+console.log(`      artifact: ${GZ} (${gzMB} MB)`)

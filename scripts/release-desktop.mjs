@@ -2,17 +2,36 @@
 // Release the desktop shell to GitHub Releases (deepseek-harness-desktop).
 //
 // Pipeline: bump versions → build (createUpdaterArtifacts + signing env) →
-// write latest.json → create release `v<version>` → upload nsis.zip + latest.json.
+// write latest.json → create release `v<version>` → upload bundle assets.
 //
 // Usage:
 //   node scripts/release-desktop.mjs --version 0.2.0 [--notes "..."] [--notes-file f]
-//       [--owner alanpeng] [--no-sidecar] [--skip-build] [--skip-upload] [--upload-only] [--upload-exe]
-//       [--config <json>] [--download-base <url>]
+//       [--owner alanpeng] [--platform windows-x86_64] [--no-sidecar]
+//       [--skip-build] [--skip-upload] [--upload-only] [--upload-exe]
+//       [--fragment] [--release-tag v0.2.0] [--config <json>] [--download-base <url>]
+//       [--clone <dsh clone dir>]
 // Requires GITHUB_TOKEN. Signing key defaults to D:\secrets\dsh-updater.key
 // (+ .pass), or TAURI_SIGNING_PRIVATE_KEY[_PATH].
+//
+// Platform model (CI runs one job per platform, all uploading to the same
+// release v<version>):
+//   windows-x86_64   bundles nsis, updater keys windows-x86_64(-nsis),
+//                    payload setup.exe(.nsis.zip)
+//   macos-x86_64     bundles app,dmg, updater key macos-x86_64,
+//                    payload <app>.app.tar.gz, dmg uploaded as extra asset
+//   macos-aarch64    same, key macos-aarch64
+//   linux-x86_64     bundles deb,appimage, updater key linux-x86_64,
+//                    payload .AppImage, deb uploaded as extra asset
+//
+// CI workflow (release.yml): a `create-release` job POSTs the release first;
+// each build job runs with --fragment + --release-tag v<v> so it builds and
+// uploads without racing on tag creation, then the finalize job merges the
+// latest-<platform>.json fragments into the final latest.json and uploads it.
+// Local runs (no --fragment) keep the old behavior: create the release here
+// and upload latest.json directly.
 
 import { execFileSync } from 'node:child_process'
-import { createReadStream, existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, statSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, statSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -21,7 +40,6 @@ const SRC_TAURI = join(ROOT, 'src-tauri')
 // Windows: `npx` is a .cmd shim that CreateProcess refuses through
 // execFileSync — invoke the real JS entry via the current node instead.
 const TAURI_CLI = join(ROOT, 'node_modules', '@tauri-apps', 'cli', 'tauri.js')
-const BUNDLE_DIR = join(SRC_TAURI, 'target', 'release', 'bundle', 'nsis')
 const KEY_PATH = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || 'D:\\secrets\\dsh-updater.key'
 const PASS_PATH = 'D:\\secrets\\dsh-updater.key.pass'
 
@@ -30,6 +48,20 @@ const VERSION = args.version
 const OWNER = args.owner || process.env.DSH_REPO_OWNER || 'alanpeng'
 const REPO = 'deepseek-harness-desktop'
 const TOKEN = process.env.GITHUB_TOKEN
+const PLATFORM = args.platform || 'windows-x86_64'
+
+const PLATFORMS = {
+  'windows-x86_64': {
+    bundles: 'nsis',
+    keys: ['windows-x86_64-nsis', 'windows-x86_64'],
+    // bundle subdir → match pattern → updater payload (sig = payload + '.sig')
+    bundleDirs: ['nsis'],
+  },
+  'macos-x86_64': { bundles: 'app,dmg', keys: ['macos-x86_64'], bundleDirs: ['macos'] },
+  'macos-aarch64': { bundles: 'app,dmg', keys: ['macos-aarch64'], bundleDirs: ['macos'] },
+  'linux-x86_64': { bundles: 'deb,appimage', keys: ['linux-x86_64'], bundleDirs: ['appimage', 'deb'] },
+}
+if (!PLATFORMS[PLATFORM]) fail(`未知平台 ${PLATFORM}（可用: ${Object.keys(PLATFORMS).join(', ')}）`)
 
 if (!VERSION) fail('--version 必填（如 0.2.0）')
 if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(VERSION)) fail(`非法版本号: ${VERSION}`)
@@ -76,6 +108,38 @@ const api = async (path, opts = {}) => {
   return res.status === 204 ? null : res.json()
 }
 
+// Discover bundle outputs. Payload = the updater artifact (setup.exe /
+// .app.tar.gz / .AppImage) with its `payload + '.sig'`; extras = installers
+// the updater doesn't consume but users want in the release (dmg, deb).
+function findPayloads() {
+  const base = join(SRC_TAURI, 'target', 'release', 'bundle')
+  const candidates = []
+  for (const sub of PLATFORMS[PLATFORM].bundleDirs) {
+    const dir = join(base, sub)
+    if (!existsSync(dir)) continue
+    for (const f of readdirSync(dir)) candidates.push(join(dir, f))
+  }
+  let payload = null
+  if (PLATFORM.startsWith('windows')) {
+    const zip = candidates.find((f) => f.endsWith('.exe.nsis.zip') && f.includes(`_${VERSION}_`))
+    const exe = candidates.find((f) => f.endsWith('-setup.exe') && f.includes(`_${VERSION}_`))
+    payload = zip || exe
+  } else if (PLATFORM.startsWith('macos')) {
+    payload = candidates.find((f) => f.endsWith('.app.tar.gz'))
+  } else {
+    payload = candidates.find((f) => f.endsWith('.AppImage'))
+  }
+  if (!payload) fail(`未找到 ${PLATFORM} 的 updater payload（bundle 目录: ${base}）`)
+  const sig = `${payload}.sig`
+  if (!existsSync(sig)) fail(`签名缺失: ${sig}`)
+  const extras = PLATFORM.startsWith('macos')
+    ? candidates.filter((f) => f.endsWith('.dmg'))
+    : PLATFORM.startsWith('linux')
+      ? candidates.filter((f) => f.endsWith('.deb'))
+      : []
+  return { payload, sig, extras }
+}
+
 // ── 1. bump versions ─────────────────────────────────────────────────────
 if (!args['upload-only']) {
   console.log('[1/5] Bumping versions…')
@@ -108,34 +172,19 @@ if (!args['upload-only']) {
 }
 
 // ── 2. build (signed, createUpdaterArtifacts) ────────────────────────────
-// Payload selection: tauri bundler 2.11.x only emits the bare setup.exe
-// (+.sig) — never setup.exe.nsis.zip (checked nsis/mod.rs at tauri-cli-v2.11.4:
-// no zip generation). The updater plugin accepts a bare .exe payload
-// (infer::archive::is_zip check → falls back to write_to_temp + NSIS /UPDATE),
-// so prefer the zip when a future bundler produces it, else the raw exe.
-const SETUP = join(BUNDLE_DIR, `dsh-desktop_${VERSION}_x64-setup.exe`)
-const ZIP = join(BUNDLE_DIR, `dsh-desktop_${VERSION}_x64-setup.exe.nsis.zip`)
-let payload, payloadName, sig
-
-if (args['upload-only']) {
-  payload = existsSync(ZIP) ? ZIP : SETUP
-  payloadName = payload === ZIP
-    ? `dsh-desktop_${VERSION}_x64-setup.exe.nsis.zip`
-    : `dsh-desktop_${VERSION}_x64-setup.exe`
-  sig = `${payload}.sig`
-  if (!existsSync(payload) || !existsSync(sig)) {
-    fail(`--upload-only 但工件缺失: ${payload}`)
-  }
-} else {
+if (!args['upload-only']) {
   if (!args['no-sidecar']) {
     console.log('[2/5] Building sidecar runtime…')
-    execFileSync(process.execPath, [join(ROOT, 'sidecar', 'build-sidecar.mjs')], { stdio: 'inherit' })
+    const flags = ['--platform', PLATFORM]
+    if (args['node-from-exec']) flags.push('--node-from-exec')
+    if (args.clone) flags.push('--clone', args.clone)
+    execFileSync(process.execPath, [join(ROOT, 'sidecar', 'build-sidecar.mjs'), ...flags], { stdio: 'inherit' })
   }
   if (!args['skip-build']) {
     console.log('[3/5] tauri build (signed)…')
     const pass = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
       || (existsSync(PASS_PATH) ? readFileSync(PASS_PATH, 'utf8').trim() : '')
-    const buildArgs = ['build', '--bundles', 'nsis']
+    const buildArgs = ['build', '--bundles', PLATFORMS[PLATFORM].bundles]
     // --config <json>: override config at build time (e.g. point the updater
     // endpoint at a local dev server for E2E testing).
     if (args.config) buildArgs.push('--config', args.config)
@@ -151,41 +200,28 @@ if (args['upload-only']) {
   } else {
     console.log('[3/5] Skipping tauri build (--skip-build)…')
   }
-  // Decide payload AFTER the build so a future bundler that emits the zip
-  // still gets picked up; 2.11.x falls through to the bare exe.
-  payload = existsSync(ZIP) ? ZIP : SETUP
-  payloadName = payload === ZIP
-    ? `dsh-desktop_${VERSION}_x64-setup.exe.nsis.zip`
-    : `dsh-desktop_${VERSION}_x64-setup.exe`
-  sig = `${payload}.sig`
-  for (const f of [payload, sig]) {
-    if (!existsSync(f)) fail(`构建产物缺失: ${f}`)
-  }
 }
+const { payload, sig, extras } = findPayloads()
 
-// ── 3. latest.json ───────────────────────────────────────────────────────
-console.log('[4/5] Writing latest.json…')
-const signature = readFileSync(sig, 'utf8').trim()
+// ── 3. latest.json (fragment when --fragment) ────────────────────────────
 // --download-base overrides asset URLs (local dev server / mirrors / E2E).
 const downloadBase = args['download-base']
   || `https://github.com/${OWNER}/${REPO}/releases/download/v${VERSION}`
-const manifest = {
+const payloadName = payload.split(/[\\/]/).pop()
+const signature = readFileSync(sig, 'utf8').trim()
+const fragment = {
   version: VERSION,
   notes: NOTES || null,
   pub_date: new Date().toISOString(),
-  platforms: {
-    'windows-x86_64-nsis': {
-      url: `${downloadBase}/${payloadName}`,
-      signature,
-    },
-    'windows-x86_64': {
-      url: `${downloadBase}/${payloadName}`,
-      signature,
-    },
-  },
+  platforms: {},
 }
-const manifestPath = join(BUNDLE_DIR, 'latest.json')
-writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+for (const key of PLATFORMS[PLATFORM].keys) {
+  fragment.platforms[key] = { url: `${downloadBase}/${payloadName}`, signature }
+}
+const fragmentName = args.fragment ? `latest-${PLATFORM}.json` : 'latest.json'
+const manifestPath = join(SRC_TAURI, 'target', 'release', 'bundle', fragmentName)
+writeFileSync(manifestPath, JSON.stringify(fragment, null, 2) + '\n')
+console.log(`[4/5] Wrote ${fragmentName} (${Object.keys(fragment.platforms).join(', ')})`)
 
 // ── 4. release + upload ──────────────────────────────────────────────────
 let releaseId = null
@@ -194,6 +230,11 @@ if (args['skip-upload']) {
 } else if (args['upload-only']) {
   const rel = await api(`/repos/${OWNER}/${REPO}/releases/tags/v${VERSION}`).catch(() => null)
   if (!rel) fail(`release v${VERSION} 不存在，无法 --upload-only`)
+  releaseId = rel.id
+} else if (args['release-tag']) {
+  // CI build job: the create-release job already made the tag; upload onto it.
+  const rel = await api(`/repos/${OWNER}/${REPO}/releases/tags/${args['release-tag']}`).catch(() => null)
+  if (!rel) fail(`release ${args['release-tag']} 不存在（先跑 create-release job）`)
   releaseId = rel.id
 } else {
   console.log('[5/5] Creating release + uploading…')
@@ -238,17 +279,21 @@ if (args['skip-upload']) {
   console.log(`正式发布：GITHUB_TOKEN=... node scripts/release-desktop.mjs --version ${VERSION} --no-sidecar`)
 } else {
   await upload(payload, payloadName)
-  if (args['upload-exe'] && payload === ZIP && existsSync(SETUP)) {
-    await upload(SETUP, `dsh-desktop_${VERSION}_x64-setup.exe`)
+  if (args['upload-exe'] && payloadName.endsWith('.zip')) {
+    await upload(payload.replace(/\.zip$/, ''), payloadName.replace(/\.nsis\.zip$/, ''))
   }
-  await upload(manifestPath, 'latest.json')
+  for (const extra of extras) await upload(extra, extra.split(/[\\/]/).pop())
+  // Fragment mode: the finalize job merges fragments and uploads latest.json.
+  if (!args.fragment) await upload(manifestPath, 'latest.json')
 }
 
 // ── 5. hygiene (artifacts live on GitHub; C: is tight) ───────────────────
 if (!args['skip-upload']) {
   rmSync(payload, { force: true })
   rmSync(sig, { force: true })
-  rmSync(manifestPath, { force: true })
+  // Keep the fragment in place — the CI finalize job needs it after this job
+  // ends (it is picked up by upload-artifact, which runs later in the job).
+  if (!args.fragment) rmSync(manifestPath, { force: true })
   console.log(`\n已发布 https://github.com/${OWNER}/${REPO}/releases/tag/v${VERSION}`)
   console.log(`客户端更新端点: ${downloadBase}/latest.json`)
 }

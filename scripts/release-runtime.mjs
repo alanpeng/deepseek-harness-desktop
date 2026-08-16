@@ -1,29 +1,33 @@
 #!/usr/bin/env node
 // Publish a dsh runtime artifact to GitHub Releases (deepseek-harness-runtime).
 //
-// Pipeline: build the sidecar runtime → tarball → sha256 → minisign sign →
-// create release `dsh-runtime-<v>` → upload tar.gz + .sha256 + .minisig.
+// Pipeline: build the sidecar runtime (build-sidecar.mjs, which also packs the
+// tarball) → sha256 → minisign sign → create release
+// `dsh-runtime-<v>-<platform>` → upload tar.gz + .sha256 + .minisig.
 //
 // Usage:
 //   node scripts/release-runtime.mjs [--owner alanpeng] [--key <path>]
-//                                    [--skip-upload] [--upload-only]
+//                                    [--platform windows-x86_64] [--node-from-exec]
+//                                    [--skip-upload] [--upload-only] [--skip-build]
+// --platform        artifact/tag platform suffix; default windows-x86_64
+// --node-from-exec  passed through to build-sidecar (CI: node 24 from setup-node)
 // Requires GITHUB_TOKEN (repo scope). Signing key defaults to
 // D:\secrets\dsh-updater.key (+ .pass), or TAURI_SIGNING_PRIVATE_KEY[_PATH].
 
-import { execFileSync, spawnSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { createReadStream, existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, statSync, renameSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url))
-const TAR = 'C:\\Windows\\System32\\tar.exe'
 const DIST = join(ROOT, 'sidecar', 'dist')
 // Windows: `npx` is a .cmd shim that CreateProcess refuses through
 // execFileSync — invoke the real JS entry via the current node instead.
 const TAURI_CLI = join(ROOT, 'node_modules', '@tauri-apps', 'cli', 'tauri.js')
 
 const args = parseArgs(process.argv.slice(2))
+const PLATFORM = args.platform || 'windows-x86_64'
 const OWNER = args.owner || process.env.DSH_REPO_OWNER || 'alanpeng'
 const REPO = 'deepseek-harness-runtime'
 const TOKEN = process.env.GITHUB_TOKEN
@@ -69,10 +73,14 @@ const api = async (path, opts = {}) => {
   return res.status === 204 ? null : res.json()
 }
 
-// ── 1. build the runtime dir ─────────────────────────────────────────────
+// ── 1. build the runtime dir + tarball ───────────────────────────────────
+// build-sidecar.mjs now packs sidecar/dist/dsh-runtime-<v>-<platform>.tar.gz
+// itself (same `runtime/` top-level layout).
 if (!args['upload-only'] && !args['skip-build']) {
   console.log('[1/4] Building sidecar runtime…')
-  execFileSync(process.execPath, [join(ROOT, 'sidecar', 'build-sidecar.mjs')], { stdio: 'inherit' })
+  const flags = ['--platform', PLATFORM]
+  if (args['node-from-exec']) flags.push('--node-from-exec')
+  execFileSync(process.execPath, [join(ROOT, 'sidecar', 'build-sidecar.mjs'), ...flags], { stdio: 'inherit' })
 }
 
 // ── 2. read the dsh version ──────────────────────────────────────────────
@@ -80,26 +88,30 @@ const pjPath = join(ROOT, 'sidecar', 'runtime', 'node_modules', '@deepseek-ai', 
 if (!existsSync(pjPath)) fail(`dsh package.json not found at ${pjPath}`)
 const VERSION = JSON.parse(readFileSync(pjPath, 'utf8')).version
 if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(VERSION)) fail(`bad dsh version: ${VERSION}`)
-const TAG = `dsh-runtime-${VERSION}`
+const TAG = `dsh-runtime-${VERSION}-${PLATFORM}`
 console.log(`[2/4] dsh version: ${VERSION} (tag ${TAG})`)
 
-// ── 3. tarball + hashes + signature ──────────────────────────────────────
+// ── 3. sha256 + signature over the packed tarball ────────────────────────
 mkdirSync(DIST, { recursive: true })
 const GZ = join(DIST, `${TAG}.tar.gz`)
 const SHA = join(DIST, `${TAG}.tar.gz.sha256`)
 const SIG = join(DIST, `${TAG}.tar.gz.minisig`)
 
 if (!args['upload-only']) {
-  console.log('[3/4] Packing + signing…')
-  rmSync(GZ, { force: true })
-  // Top-level dir is `runtime/` (the app resolves it via find_top_dir).
-  const rc = spawnSync(TAR, ['-czf', GZ, '-C', join(ROOT, 'sidecar'), 'runtime'], { stdio: 'inherit' })
-  if (rc.status !== 0) fail(`tar pack failed (exit ${rc.status})`)
+  if (!existsSync(GZ)) fail(`tarball not found at ${GZ}（先运行 build-sidecar.mjs）`)
+  console.log('[3/4] Signing…')
 
   const hex = createHash('sha256').update(readFileSync(GZ)).digest('hex')
   writeFileSync(SHA, `${hex}  ${TAG}.tar.gz\n`)
 
-  const keyPath = KEY_PATH
+  // CI injects the key CONTENT via TAURI_SIGNING_PRIVATE_KEY (the local
+  // D:\secrets path does not exist there) — materialize it into a temp file
+  // the tauri CLI can open.
+  let keyPath = process.env.TAURI_SIGNING_PRIVATE_KEY_PATH || KEY_PATH
+  if (!process.env.TAURI_SIGNING_PRIVATE_KEY_PATH && process.env.TAURI_SIGNING_PRIVATE_KEY) {
+    keyPath = join(DIST, '.dsh-updater.key.tmp')
+    writeFileSync(keyPath, process.env.TAURI_SIGNING_PRIVATE_KEY)
+  }
   const passPath = 'D:\\secrets\\dsh-updater.key.pass'
   const pass = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
     || (existsSync(passPath) ? readFileSync(passPath, 'utf8').trim() : '')
@@ -131,6 +143,8 @@ if (args['skip-upload']) {
   releaseId = rel.id
 } else {
   console.log('[4/4] Creating release + uploading…')
+  // Idempotent: re-running the same version (CI matrix re-run, tag rebuild)
+  // uploads onto the existing release instead of failing on a duplicate tag.
   const rel = await api(`/repos/${OWNER}/${REPO}/releases`, {
     method: 'POST',
     body: {
@@ -138,6 +152,11 @@ if (args['skip-upload']) {
       name: TAG,
       body: `dsh runtime ${VERSION}\n\nSource: npm @deepseek-ai/dsh@${VERSION}`,
     },
+  }).catch(async (err) => {
+    const existing = await api(`/repos/${OWNER}/${REPO}/releases/tags/${TAG}`).catch(() => null)
+    if (!existing) throw err
+    console.log(`  release ${TAG} 已存在，复用现有 release`)
+    return existing
   })
   releaseId = rel.id
 }

@@ -1,0 +1,179 @@
+# 三平台发布：push tag v*（或 workflow_dispatch 手动触发）后，
+# 4 个并行 build job（Windows NSIS / macOS x64 / macOS arm64 / Linux）各自
+# 构建 sidecar runtime + shell bundle，上传到 release v<version>；
+# finalize job 合并各平台 latest.json 片段并上传最终 latest.json。
+#
+# 需要的 secrets（repo Settings → Secrets and variables → Actions）：
+#   TAURI_SIGNING_PRIVATE_KEY          D:\secrets\dsh-updater.key 的完整内容
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD 对应密码
+#   GH_PAT                             带 repo 权限的 PAT（跨仓库上传 runtime）
+#
+# macOS 未签名（无 Apple 证书）：Gatekeeper 下需要右键打开。
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 0.1.1）；push tag 触发时自动取 tag 名'
+        required: false
+      notes:
+        description: '发布说明（Release body）'
+        required: false
+      runtime-ref:
+        description: 'deepseek-harness 克隆的分支/tag'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.out.outputs.version }}
+    steps:
+      - id: out
+        run: |
+          V="${{ github.event.inputs.version }}"
+          if [ -z "$V" ] && [ "${{ github.event_name }}" = "push" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$V" ]; then
+            echo "::error::需要 version：workflow_dispatch 输入，或 push v* tag"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  # 先建 release，build jobs 用 --release-tag 复用，避免 4 个 job 并发 POST
+  # 撞同一个 tag。重复运行时 422 属正常（build 会复用现有 release）。
+  create-release:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release v${{ needs.version.outputs.version }}
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          BODY="${{ github.event.inputs.notes }}"
+          [ -z "$BODY" ] && BODY="dsh-desktop $V"
+          JSON="$(jq -n --arg t "v$V" --arg n "$BODY" '{tag_name:$t,name:$t,body:$n}')"
+          curl -fsS -X POST "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            -d "$JSON" -o /dev/null \
+            || echo "::warning::release v$V 已存在或创建失败（build 将复用现有 release）"
+
+  build:
+    needs: [version, create-release]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Intel runner：macos-15（退役后换成仍维护的 x64 标签）
+          # macOS arm64：macos-latest（若仍是 x64，换成 Apple Silicon 标签）
+          # 两者都有 arch sanity 步骤兜底，平台后缀与 runner 不匹配会直接失败
+          - { os: windows-latest, platform: windows-x86_64, bundles: nsis }
+          - { os: macos-15, platform: macos-x86_64, bundles: app,dmg }
+          - { os: macos-latest, platform: macos-aarch64, bundles: app,dmg }
+          - { os: ubuntu-latest, platform: linux-x86_64, bundles: deb,appimage }
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout deepseek-harness (runtime source)
+        uses: actions/checkout@v4
+        with:
+          repository: alanpeng/deepseek-harness
+          path: deepseek-harness
+          ref: ${{ github.event.inputs.runtime-ref || 'main' }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # npm 全局装而不是 corepack：Windows 上 build-sidecar 从
+      # %APPDATA%\npm\node_modules\pnpm\bin\pnpm.mjs 解析 pnpm（.cmd shim
+      # 在 execFileSync 下不可靠），npm -g 与本地布局一致。
+      - name: Install pnpm
+        run: npm install -g pnpm@11
+
+      - name: Install Linux build deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev libxdo-dev
+
+      - name: Sanity runner arch
+        shell: bash
+        run: |
+          arch="$(uname -m)"
+          echo "runner arch: $arch (target ${{ matrix.platform }})"
+          case "${{ matrix.platform }}" in
+            *x86_64)  test "$arch" = "x86_64" || { echo "::error::runner 架构与平台不匹配"; exit 1; } ;;
+            *aarch64) test "$arch" = "arm64"  || { echo "::error::runner 架构与平台不匹配"; exit 1; } ;;
+          esac
+
+      # sidecar runtime + shell bundle + 上传（release 由 create-release 建好）
+      - name: Build shell bundle and upload
+        shell: bash
+        run: |
+          node scripts/release-desktop.mjs \
+            --version "${{ needs.version.outputs.version }}" \
+            --platform "${{ matrix.platform }}" \
+            --fragment \
+            --release-tag "v${{ needs.version.outputs.version }}" \
+            --node-from-exec \
+            --clone "${{ github.workspace }}/deepseek-harness" \
+            --notes "${{ github.event.inputs.notes }}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # runtime 工件跨仓库上传（deepseek-harness-runtime），用 GH_PAT；
+      # --skip-build 复用上一步已打包的 dist tar.gz（--upload-only 幂等）
+      - name: Release runtime artifact
+        shell: bash
+        run: |
+          node scripts/release-runtime.mjs \
+            --platform "${{ matrix.platform }}" \
+            --skip-build --upload-only
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+
+      - name: Upload latest.json fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-${{ matrix.platform }}
+          path: src-tauri/target/release/bundle/latest-${{ matrix.platform }}.json
+          if-no-files-found: error
+
+  finalize:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'latest-*'
+          merge-multiple: true
+          path: fragments
+
+      - name: Merge and upload latest.json
+        run: |
+          node scripts/merge-latest.mjs \
+            --dir fragments \
+            --version "${{ needs.version.outputs.version }}"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
