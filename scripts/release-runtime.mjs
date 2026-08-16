@@ -190,13 +190,32 @@ async function upload(file, name) {
   })
   if (!res.ok) {
     const text = await res.text()
-    // Idempotent re-runs: same version re-triggered, asset already on the
-    // release — treat same-size duplicates as success instead of failing.
+    // Idempotent re-runs: same version re-triggered, the asset name is taken.
+    // GitHub has no overwrite endpoint — drop the stale asset and re-upload
+    // so the release always carries the newest build. (Same-size skip doesn't
+    // work: rebuilds differ byte-wise — tar mtimes.)
     if (res.status === 422) {
       const existing = await api(`/repos/${OWNER}/${REPO}/releases/${releaseId}/assets`).catch(() => [])
       const hit = existing.find((a) => a.name === name)
-      if (hit && hit.size === statSync(file).size) {
-        console.log(`  ${name} 已存在（同尺寸），跳过`)
+      if (hit) {
+        console.log(`  ${name} 已存在（旧 ${Math.round(hit.size / 1048576)} MB），删除后重传…`)
+        await api(`/repos/${OWNER}/${REPO}/releases/assets/${hit.id}`, { method: 'DELETE' })
+        const retry = await fetch(url, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${TOKEN}`,
+            'Content-Type': 'application/octet-stream',
+            'User-Agent': 'dsh-desktop-release',
+            'Content-Length': String(statSync(file).size),
+          },
+          body: createReadStream(file),
+          duplex: 'half',
+        })
+        if (!retry.ok) {
+          const t2 = await retry.text()
+          throw new Error(`upload ${name} failed after replace: ${retry.status} ${t2.slice(0, 300)}`)
+        }
+        console.log(`  replaced ${name}`)
         return
       }
     }
