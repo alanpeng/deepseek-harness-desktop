@@ -75,7 +75,12 @@ jobs:
           # arch sanity 步骤兜底平台后缀与 runner 不匹配的情况。
           - { os: windows-latest, platform: windows-x86_64, bundles: nsis }
           - { os: macos-latest, platform: macos-aarch64, bundles: app,dmg }
-          - { os: ubuntu-latest, platform: linux-x86_64, bundles: deb,appimage }
+          # ubuntu-22.04 (not -latest): ships libfuse2 which linuxdeploy's
+          # AppImage needs (24.04 renamed/dropped it and linuxdeploy fails
+          # with a swallowed 'failed to run linuxdeploy'); glibc 2.35 also
+          # makes the artifacts runnable on RHEL 9 (glibc 2.34) and the deb's
+          # webkit2gtk dep resolves on both 22.04 and 24.04.
+          - { os: ubuntu-22.04, platform: linux-x86_64, bundles: deb,appimage }
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
