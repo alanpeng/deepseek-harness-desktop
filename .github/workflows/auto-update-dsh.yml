@@ -67,8 +67,35 @@ jobs:
             exit 0
           fi
           echo "发现新版 $LATEST（当前 $CUR），开始 bump…"
-          # bump package.json
-          node -e 'const fs=require("fs");const p="sidecar/runtime-manifest/package.json";const j=JSON.parse(fs.readFileSync(p,"utf8"));j.dependencies["@deepseek-ai/dsh"]="'"$LATEST"'";fs.writeFileSync(p,JSON.stringify(j,null,2)+"\n")'
+          # bump dsh 及全部 @deepseek-ai/* 子包到各自最高可接受版本。
+          # 官方按 workspace 同步发版（dsh 0.1.0-rc.6 时子包同发 0.1.0-rc.6）；
+          # 只升 dsh 会把闭包变成"新 dsh + 旧插件"混装 —— v0.1.1 事故根源：
+          # dsh-subprocess-local@0.1.0-rc.6 需要 SubprocessRuntime 导出，
+          # 而 dsh-subprocess 停在 0.0.1-rc.1（npm latest tag 误导）没有该导出。
+          # 过滤规则与上方一致：只接受 x.y.z / x.y.z-rc.N，dev/alpha/beta 忽略。
+          node -e '
+            const fs = require("fs")
+            const p = "sidecar/runtime-manifest/package.json"
+            const j = JSON.parse(fs.readFileSync(p, "utf8"))
+            j.dependencies["@deepseek-ai/dsh"] = "'"$LATEST"'"
+            const parse = (v) => { const m = /^(\d+)\.(\d+)\.(\d+)(?:-(rc)\.(\d+))?$/.exec(v); return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] === "rc" ? Number(m[5]) : Infinity] : null }
+            const cmp = (a, b) => { const x = parse(a), y = parse(b); if (!x || !y) return 0; for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0 }
+            ;(async () => {
+              const names = Object.keys(j.dependencies).filter((k) => k.startsWith("@deepseek-ai/"))
+              for (const n of names) {
+                if (n === "@deepseek-ai/dsh") continue
+                const doc = await (await fetch(`https://registry.npmjs.org/${n.replace("/", "%2F")}`)).json()
+                const ok = Object.keys(doc.versions).filter((v) => parse(v))
+                ok.sort(cmp)
+                const best = ok[ok.length - 1]
+                if (best && best !== j.dependencies[n]) {
+                  console.log(`  ${n}: ${j.dependencies[n]} -> ${best}`)
+                  j.dependencies[n] = best
+                }
+              }
+              fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n")
+            })()
+          '
           # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）
           cd sidecar/runtime-manifest
           node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --lockfile-only --config.confirmModulesPurge=false
