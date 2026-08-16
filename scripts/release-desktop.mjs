@@ -207,15 +207,25 @@ const { payload, sig, extras } = findPayloads()
 // --download-base overrides asset URLs (local dev server / mirrors / E2E).
 const downloadBase = args['download-base']
   || `https://github.com/${OWNER}/${REPO}/releases/download/v${VERSION}`
-// macOS updater artifact ships as bare <app>.app.tar.gz (tauri's updater
-// bundle) with no platform hint — Windows exe carries x64 and the AppImage
-// carries amd64. Rename the uploaded asset so it identifies the platform:
-// dsh-desktop_<v>_macos-aarch64.app.tar.gz. The signature is content-bound,
-// not name-bound, so this is safe; latest.json URLs use the same name.
-let payloadName = payload.split(/[\\/]/).pop()
-if (payloadName === 'dsh-desktop.app.tar.gz') {
-  payloadName = `dsh-desktop_${VERSION}_${PLATFORM}.app.tar.gz`
+// tauri asset names carry architecture (x64 / aarch64 / amd64) but not the
+// platform, and the macOS updater artifact is bare <app>.app.tar.gz. Prefix
+// a platform segment so release assets are self-describing:
+//   dsh-desktop_<v>_win_x64-setup.exe
+//   dsh-desktop_<v>_macos-aarch64.app.tar.gz   (+ _macos-aarch64.dmg)
+//   dsh-desktop_<v>_linux_amd64.AppImage       (+ _linux_amd64.deb)
+// "linux" (not "ubuntu"): the AppImage runs on any distro with glibc ≥2.35.
+// Signatures are content-bound, not name-bound, so renaming is safe;
+// latest.json URLs follow.
+function qualifyAssetName(fname) {
+  if (PLATFORM === 'windows-x86_64') return fname.replace('_x64-setup', '_win_x64-setup')
+  if (PLATFORM === 'macos-aarch64') {
+    if (fname === 'dsh-desktop.app.tar.gz') return `dsh-desktop_${VERSION}_macos-aarch64.app.tar.gz`
+    return fname.replace('_aarch64.dmg', '_macos-aarch64.dmg')
+  }
+  if (PLATFORM === 'linux-x86_64') return fname.replace('_amd64.', '_linux_amd64.')
+  return fname
 }
+let payloadName = qualifyAssetName(payload.split(/[\\/]/).pop())
 const signature = readFileSync(sig, 'utf8').trim()
 const fragment = {
   version: VERSION,
@@ -290,7 +300,7 @@ if (args['skip-upload']) {
   if (args['upload-exe'] && payloadName.endsWith('.zip')) {
     await upload(payload.replace(/\.zip$/, ''), payloadName.replace(/\.nsis\.zip$/, ''))
   }
-  for (const extra of extras) await upload(extra, extra.split(/[\\/]/).pop())
+  for (const extra of extras) await upload(extra, qualifyAssetName(extra.split(/[\\/]/).pop()))
   // Fragment mode: the finalize job merges fragments and uploads latest.json.
   if (!args.fragment) await upload(manifestPath, 'latest.json')
 }
