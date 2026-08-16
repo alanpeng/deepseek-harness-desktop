@@ -52,16 +52,49 @@ npm run sidecar:build
 npm run build
 ```
 
-## 发布
+## 发布与更新机制
 
-两个 GitHub 仓库、同一对签名密钥（`npx tauri signer generate` 生成，密钥务必保存在仓库之外）：
+### 三平台自动发布（GitHub Actions）
 
-- **`deepseek-harness-desktop`** — 壳发布。`npm run release:desktop -- --version <v>`
-  自动 bump 版本、带 `createUpdaterArtifacts` 构建、上传 NSIS 安装包 + `latest.json`。
-- **`deepseek-harness-runtime`** — 运行时工件发布。`npm run release:runtime` 打包
-  `sidecar/runtime/`、签名并上传 `dsh-runtime-<v>.tar.gz` + `.sha256` + `.minisig`。
+发布完全由 CI 承担：push `v*` tag 或 Actions 手动触发（workflow_dispatch 填版本号）→ `release.yml` 在三平台并行构建并发布到 GitHub Releases：
 
-需要环境变量 `GITHUB_TOKEN`（repo scope）。
+| 平台 | runner | 产物 |
+|---|---|---|
+| Windows | windows-latest | `dsh-desktop_<v>_win_x64-setup.exe`（NSIS） |
+| macOS | macos-latest（Apple Silicon，未签名） | `dsh-desktop_<v>_macos-aarch64.app.tar.gz` + `.dmg` |
+| Linux | ubuntu-24.04 | `dsh-desktop_<v>_linux_amd64.AppImage` + `.deb` |
+
+- 资产统一 `dsh-desktop_<版本>_<平台>` 命名；`latest.json` 由 finalize job 合并各平台片段后上传，壳更新直接命中
+- macOS 无 Apple 证书，包**未签名**：Gatekeeper 下需右键打开
+- Linux 构建机为 ubuntu-24.04（当前 tauri 链要求 webkit2gtk-4.1，22.04 无法编译）；产物 glibc 2.39，**不保证** RHEL 9 系（glibc 2.34）兼容
+- 同一版本重跑幂等：同名资产删除后重传
+
+### 自动跟进官方 dsh（运行时通道）
+
+`auto-update-dsh.yml` 每小时检查 npm 的 `@deepseek-ai/dsh`：
+
+- 接受正式版（`x.y.z`）与 RC（`x.y.z-rc.N`），忽略 `-dev`/`-alpha`/`-beta` 等
+- 发现可接受的新版本 → 自动 bump `sidecar/runtime-manifest` + 更新 lockfile → 提交 → 三平台构建并发布 `dsh-runtime-<v>-<platform>.tar.gz`（+ `.sha256` + `.minisig` 签名）到 `deepseek-harness-runtime`
+
+### 客户端更新：整包替换，零编译
+
+两条独立通道，**桌面壳不升级不影响运行时升级**：
+
+- **壳**：`tauri-plugin-updater` 从 GitHub Releases 下载安装包，NSIS 静默安装 + 自动重启
+- **运行时**：启动 15 秒后（及手动"检查更新"）查 npm dist-tags（`latest`/`next`）→ 发现新版下载**预打包闭包**（node 二进制 + 全部 node_modules 已在 CI 构建完毕）→ sha256 + minisign 校验 → 原子替换 `dsh-runtime/` → 重启 Host。用户端无任何编译/安装动作
+- 时序：资产需先由 CI 发布（cron 每小时 + 构建约 30 分钟）；若用户先于资产就绪检查到新版，下载 404 → 保留旧版本，下次启动重试
+
+### 签名与密钥
+
+- 壳与运行时共用一对 minisign 密钥（`npx tauri signer generate` 生成）；私钥只存在于 CI secrets（`TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]`）与本机密钥文件，永不入库
+- 运行时跨仓库上传需要 `GH_PAT`（repo scope）secret
+
+### 本地调试 / 重跑
+
+发布默认走 CI；本地调试或重跑时也可直接调用发布脚本（需要 `GITHUB_TOKEN` 与签名密钥）：
+
+- 壳：`npm run release:desktop -- --version <v>` — bump 版本、带 `createUpdaterArtifacts` 构建、上传安装包 + `latest.json`
+- 运行时：`npm run release:runtime` — 打包 `sidecar/runtime/`、签名并上传 `dsh-runtime-<v>.tar.gz` + `.sha256` + `.minisig`
 
 ## 协议
 

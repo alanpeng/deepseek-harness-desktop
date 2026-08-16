@@ -59,16 +59,65 @@ npm run sidecar:build
 npm run build
 ```
 
-## Releasing
+## Release & update mechanism
 
-Two GitHub repos, one signing keypair (`npx tauri signer generate` — keep it outside this repo):
+### Automated three-platform releases (GitHub Actions)
 
-- **`deepseek-harness-desktop`** — shell releases. `npm run release:desktop -- --version <v>`
-  bumps versions, builds with `createUpdaterArtifacts`, uploads the NSIS zip + `latest.json`.
-- **`deepseek-harness-runtime`** — runtime tarballs. `npm run release:runtime` packs
-  `sidecar/runtime/`, signs it, and uploads `dsh-runtime-<v>.tar.gz` + `.sha256` + `.minisig`.
+Releases are fully handled by CI: push a `v*` tag or trigger manually via Actions
+(`workflow_dispatch` with a version) → `release.yml` builds and publishes on three
+platforms in parallel:
 
-Requires `GITHUB_TOKEN` (repo scope) in the environment.
+| Platform | Runner | Artifacts |
+|---|---|---|
+| Windows | windows-latest | `dsh-desktop_<v>_win_x64-setup.exe` (NSIS) |
+| macOS | macos-latest (Apple Silicon, unsigned) | `dsh-desktop_<v>_macos-aarch64.app.tar.gz` + `.dmg` |
+| Linux | ubuntu-24.04 | `dsh-desktop_<v>_linux_amd64.AppImage` + `.deb` |
+
+- Assets are uniformly named `dsh-desktop_<version>_<platform>`; a finalize job merges the
+  per-platform fragments into `latest.json`, which the shell updater hits directly.
+- macOS builds are **unsigned** (no Apple certificate): Gatekeeper requires right-click open.
+- Linux builds on ubuntu-24.04 (the current tauri chain requires webkit2gtk-4.1, which 22.04
+  cannot provide); artifacts carry glibc 2.39 and are **not guaranteed** on RHEL 9 (glibc 2.34).
+- Re-running the same version is idempotent: same-name assets are deleted and re-uploaded.
+
+### Auto-tracking official dsh (runtime channel)
+
+`auto-update-dsh.yml` polls npm for `@deepseek-ai/dsh` every hour:
+
+- Accepts stable (`x.y.z`) and RC (`x.y.z-rc.N`) versions; ignores `-dev`/`-alpha`/`-beta` etc.
+- On an acceptable new version: bumps `sidecar/runtime-manifest` + refreshes the lockfile,
+  commits, then builds and publishes `dsh-runtime-<v>-<platform>.tar.gz` (+ `.sha256` +
+  `.minisig` signature) to `deepseek-harness-runtime` on all three platforms.
+
+### Client updates: whole-closure swap, zero compilation
+
+Two independent channels — **the shell version does not gate runtime updates**:
+
+- **Shell**: `tauri-plugin-updater` downloads the installer from GitHub Releases, runs NSIS
+  passively, and relaunches the app itself.
+- **Runtime**: 15 s after startup (and on manual "check for updates") it queries npm dist-tags
+  (`latest`/`next`) → on a newer version it downloads the **pre-built closure** (node binary +
+  the full node_modules, assembled by CI) → verifies sha256 + minisign → atomically swaps
+  `dsh-runtime/` → restarts the host. Nothing is compiled or installed on the client.
+- Timing: the artifacts must exist first (hourly cron + ~30 min build). If a client checks
+  before they are ready, the download 404s → the old version is kept and the next launch retries.
+
+### Signing & keys
+
+- The shell and runtime share one minisign keypair (`npx tauri signer generate`); the private
+  key lives only in CI secrets (`TAURI_SIGNING_PRIVATE_KEY[_PASSWORD]`) and the local key file,
+  never in the repo.
+- Cross-repo runtime uploads need the `GH_PAT` (repo scope) secret.
+
+### Local debugging / re-runs
+
+Releases default to CI; the scripts can still be run locally (requires `GITHUB_TOKEN` and the
+signing key):
+
+- Shell: `npm run release:desktop -- --version <v>` — bumps versions, builds with
+  `createUpdaterArtifacts`, uploads the installer + `latest.json`.
+- Runtime: `npm run release:runtime` — packs `sidecar/runtime/`, signs, and uploads
+  `dsh-runtime-<v>.tar.gz` + `.sha256` + `.minisig`.
 
 ## License
 
