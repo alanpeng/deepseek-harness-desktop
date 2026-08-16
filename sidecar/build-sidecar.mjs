@@ -261,6 +261,26 @@ if (PLATFORMS[PLATFORM].trimDeepPaths) {
   }
 }
 
+// koffi's linux package ships BOTH glibc and musl .node builds
+// (glibc_x64/ + musl_x64/); the bundled glibc node never loads the musl one,
+// but linuxdeploy scans every ELF in the AppDir and hard-fails on the musl
+// build ("Could not find dependency: libc.musl-x86_64.so.1"). Drop it before
+// packing — only the Linux AppImage path is affected.
+if (PLATFORM.startsWith('linux')) {
+  const koffiRoot = join(RUNTIME_OUT, 'node_modules', '@koromix')
+  if (existsSync(koffiRoot)) {
+    for (const pkg of readdirSync(koffiRoot).filter((n) => n.startsWith('koffi-linux-'))) {
+      const pkgDir = join(koffiRoot, pkg)
+      for (const sub of readdirSync(pkgDir)) {
+        if (sub.startsWith('musl_')) {
+          rmSync(join(pkgDir, sub), { recursive: true, force: true })
+          console.log(`  pruned ${join(pkgDir, sub)} (musl build; linuxdeploy)`)
+        }
+      }
+    }
+  }
+}
+
 // ── 3. pack the artifact ─────────────────────────────────────────────────
 console.log('[3/4] Packing tarball')
 const pjPath = join(RUNTIME_OUT, 'node_modules', '@deepseek-ai', 'dsh', 'package.json')
