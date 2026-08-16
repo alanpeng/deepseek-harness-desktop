@@ -26,7 +26,7 @@ on:
       runtime-ref:
         description: 'deepseek-harness 克隆的分支/tag'
         required: false
-        default: 'main'
+        default: 'master'
 
 permissions:
   contents: write
@@ -85,14 +85,16 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
+      # 上游 dsh 源码在 deepseek-ai 组织下（公开仓库，默认分支 master），
+      # 不是 alanpeng/deepseek-harness —— 写错组织名会 404 not found。
       - name: Checkout deepseek-harness (runtime source)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
-          repository: alanpeng/deepseek-harness
+          repository: deepseek-ai/deepseek-harness
           path: deepseek-harness
-          ref: ${{ github.event.inputs.runtime-ref || 'main' }}
+          ref: ${{ github.event.inputs.runtime-ref || 'master' }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -151,7 +153,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
 
       - name: Upload latest.json fragment
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: latest-${{ matrix.platform }}
           path: src-tauri/target/release/bundle/latest-${{ matrix.platform }}.json
@@ -161,10 +163,10 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download fragments
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           pattern: 'latest-*'
           merge-multiple: true
