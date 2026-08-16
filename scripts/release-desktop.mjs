@@ -286,6 +286,16 @@ async function upload(file, name) {
   })
   if (!res.ok) {
     const text = await res.text()
+    // Idempotent re-runs: same version re-triggered, asset already on the
+    // release — treat same-size duplicates as success instead of failing.
+    if (res.status === 422) {
+      const existing = await api(`/repos/${OWNER}/${REPO}/releases/${releaseId}/assets`).catch(() => [])
+      const hit = existing.find((a) => a.name === name)
+      if (hit && hit.size === statSync(file).size) {
+        console.log(`  ${name} 已存在（同尺寸），跳过`)
+        return
+      }
+    }
     throw new Error(`upload ${name} failed: ${res.status} ${text.slice(0, 300)}`)
   }
   console.log(`  uploaded ${name}`)
