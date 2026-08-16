@@ -1,6 +1,10 @@
 //! `dshdesktop://` protocol: HKCU registration (no admin needed), argv
 //! parsing, and window activation.
 //!
+//! Windows-only module: HKCU registration needs winreg, which does not
+//! compile on other platforms. Declared as #[cfg(windows)] in main.rs.
+#![cfg(windows)]
+//!
 //! The dsh web app is a state-driven SPA without URL routing, so a deep link
 //! currently means "bring the window to the foreground" — the URL itself is
 //! logged and kept for a future client routing integration. Navigation is

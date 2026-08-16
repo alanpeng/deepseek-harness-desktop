@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+#[cfg(windows)]
 mod deep_link;
 mod host;
 mod runtime_update;
@@ -16,14 +17,19 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // A second launch was requested: hand any dshdesktop:// URL over
             // to the running instance (logged; the web app has no routing yet)
             // and surface the window. The plugin exits the second instance.
-            if let Some(url) = deep_link::parse_deep_link(&argv) {
-                eprintln!("[dsh-desktop] deep link (second instance): {url}");
+            // Deep links are Windows-only (dshdesktop:// protocol registration).
+            #[cfg(windows)]
+            {
+                let argv = _argv;
+                if let Some(url) = deep_link::parse_deep_link(&argv) {
+                    eprintln!("[dsh-desktop] deep link (second instance): {url}");
+                }
+                deep_link::activate(app);
             }
-            deep_link::activate(app);
         }))
         // Updater config (endpoints + pubkey) lives in tauri.conf.json.
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -32,13 +38,17 @@ fn main() {
         .manage(updates::UpdateState::default())
         .manage(runtime_update::RuntimeState::default())
         .setup(|app| {
-            // Keep the dshdesktop:// registration pointing at this exe.
-            if let Ok(exe) = std::env::current_exe() {
-                deep_link::register_protocol(&exe);
-            }
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            if let Some(url) = deep_link::parse_deep_link(&args) {
-                eprintln!("[dsh-desktop] deep link (cold start): {url}");
+            // Keep the dshdesktop:// registration pointing at this exe
+            // (Windows-only; the protocol lives in HKCU).
+            #[cfg(windows)]
+            {
+                if let Ok(exe) = std::env::current_exe() {
+                    deep_link::register_protocol(&exe);
+                }
+                let args: Vec<String> = std::env::args().skip(1).collect();
+                if let Some(url) = deep_link::parse_deep_link(&args) {
+                    eprintln!("[dsh-desktop] deep link (cold start): {url}");
+                }
             }
             match host::start_host(app.handle()) {
                 Ok(port) => {
