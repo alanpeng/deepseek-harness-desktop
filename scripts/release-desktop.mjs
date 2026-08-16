@@ -207,7 +207,15 @@ const { payload, sig, extras } = findPayloads()
 // --download-base overrides asset URLs (local dev server / mirrors / E2E).
 const downloadBase = args['download-base']
   || `https://github.com/${OWNER}/${REPO}/releases/download/v${VERSION}`
-const payloadName = payload.split(/[\\/]/).pop()
+// macOS updater artifact ships as bare <app>.app.tar.gz (tauri's updater
+// bundle) with no platform hint — Windows exe carries x64 and the AppImage
+// carries amd64. Rename the uploaded asset so it identifies the platform:
+// dsh-desktop_<v>_macos-aarch64.app.tar.gz. The signature is content-bound,
+// not name-bound, so this is safe; latest.json URLs use the same name.
+let payloadName = payload.split(/[\\/]/).pop()
+if (payloadName === 'dsh-desktop.app.tar.gz') {
+  payloadName = `dsh-desktop_${VERSION}_${PLATFORM}.app.tar.gz`
+}
 const signature = readFileSync(sig, 'utf8').trim()
 const fragment = {
   version: VERSION,
