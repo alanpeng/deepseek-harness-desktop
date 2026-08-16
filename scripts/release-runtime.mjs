@@ -144,7 +144,7 @@ if (args['skip-upload']) {
 
 async function upload(file, name) {
   const url = `https://uploads.github.com/repos/${OWNER}/${REPO}/releases/${releaseId}/assets?name=${encodeURIComponent(name)}`
-  const size = file.stat ? file.stat.size : file.length
+  const size = statSync(file).size
   console.log(`  uploading ${name} (${Math.round(size / 1048576)} MB)…`)
   const res = await fetch(url, {
     method: 'POST',
@@ -152,8 +152,13 @@ async function upload(file, name) {
       Authorization: `Bearer ${TOKEN}`,
       'Content-Type': 'application/octet-stream',
       'User-Agent': 'dsh-desktop-release',
+      // GitHub uploads API rejects chunked transfer — send an explicit
+      // Content-Length (stream length is known via statSync).
+      'Content-Length': String(size),
     },
-    body: file,
+    // undici fetch rejects stream bodies without the duplex flag (Node 18+).
+    body: createReadStream(file),
+    duplex: 'half',
   })
   if (!res.ok) {
     const text = await res.text()
@@ -166,9 +171,9 @@ if (args['skip-upload']) {
   console.log(`\n--skip-upload：工件已就绪（${GZ} + .sha256 + .minisig）`)
   console.log(`完整发布：GITHUB_TOKEN=... node scripts/release-runtime.mjs --upload-only --skip-build`)
 } else {
-  await upload(createReadStream(GZ), `${TAG}.tar.gz`)
-  await upload(createReadStream(SHA), `${TAG}.tar.gz.sha256`)
-  await upload(createReadStream(SIG), `${TAG}.tar.gz.minisig`)
+  await upload(GZ, `${TAG}.tar.gz`)
+  await upload(SHA, `${TAG}.tar.gz.sha256`)
+  await upload(SIG, `${TAG}.tar.gz.minisig`)
 }
 
 // ── hygiene: the artifacts live on GitHub now ────────────────────────────
