@@ -75,15 +75,16 @@ jobs:
           # arch sanity 步骤兜底平台后缀与 runner 不匹配的情况。
           - { os: windows-latest, platform: windows-x86_64, bundles: nsis }
           - { os: macos-latest, platform: macos-aarch64, bundles: app,dmg }
-          # ubuntu-22.04 (not -latest): ships libfuse2 which linuxdeploy's
-          # AppImage needs (24.04 renamed/dropped it and linuxdeploy fails
-          # with a swallowed 'failed to run linuxdeploy'); glibc 2.35 also
-          # makes the artifacts runnable on RHEL 9 (glibc 2.34) and the deb's
-          # webkit2gtk dep resolves on both 22.04 and 24.04.
-          # webkit-dev must match the release: jammy ships webkit2gtk-4.0,
-          # noble+ ships 4.1 (the 4.1 package doesn't exist on 22.04 and a
-          # single missing package fails the whole apt install).
-          - { os: ubuntu-22.04, platform: linux-x86_64, bundles: deb,appimage, webkit: libwebkit2gtk-4.0-dev }
+          # ubuntu-24.04 (not 22.04): the current tauri chain (wry 0.55.1
+          # pins webkit2gtk =2.0.2, whose sys crate dropped webkit2gtk-4.0
+          # support) requires webkit2gtk-4.1 — jammy ships 4.0 only, so 22.04
+          # cannot build at all. noble has libwebkit2gtk-4.1-dev; its missing
+          # libfuse2 (dropped in 24.04) is supplied by libfuse2t64 for
+          # linuxdeploy, and APPIMAGE_EXTRACT_AND_RUN=1 skips FUSE mounting.
+          # glibc 2.39 artifacts are not guaranteed on RHEL 9 (glibc 2.34);
+          # deterministic RHEL 9 support would need a self-hosted AlmaLinux 9
+          # runner (glibc 2.34 + webkit2gtk4.1-devel, same constraints).
+          - { os: ubuntu-24.04, platform: linux-x86_64, bundles: deb,appimage }
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -120,15 +121,16 @@ jobs:
             pnpm install --frozen-lockfile
           fi
 
-      # matrix.os 是 ubuntu-22.04，这里曾误写 'ubuntu-latest' 导致该步骤
+      # matrix.os 是 ubuntu-24.04，这里曾误写 'ubuntu-latest' 导致该步骤
       # 永远跳过 —— 整个 Linux 构建没有任何 GTK 依赖，gdk-sys 直接炸。
-      # webkit 包名按发行版从 matrix 取（见 matrix include 注释）。
+      # libfuse2t64: 24.04 把 libfuse2 换成了 t64 重构建，linuxdeploy 的
+      # AppImage 需要 libfuse.so.2（配合 APPIMAGE_EXTRACT_AND_RUN=1 双保险）。
       - name: Install Linux build deps
         if: matrix.platform == 'linux-x86_64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ${{ matrix.webkit }} libappindicator3-dev \
-            librsvg2-dev patchelf libgtk-3-dev libxdo-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev libxdo-dev libfuse2t64
           # 提前暴露缺包问题，别等 rust 编译到一半才报 pkg-config
           pkg-config --exists gtk+-3.0 gdk-3.0 || {
             echo "::error::GTK dev 包未就绪: $(pkg-config --modversion gtk+-3.0 2>&1)"
@@ -144,6 +146,19 @@ jobs:
             *x86_64)  test "$arch" = "x86_64" || { echo "::error::runner 架构与平台不匹配"; exit 1; } ;;
             *aarch64) test "$arch" = "arm64"  || { echo "::error::runner 架构与平台不匹配"; exit 1; } ;;
           esac
+
+      # tauri 在 linuxdeploy 失败时只报一句 'failed to run linuxdeploy'
+      # （stderr 被吞），预检提前暴露 FUSE/提取问题；同时把 linuxdeploy
+      # AppImage 预下载进 tauri 的缓存目录，正式打包直接复用。
+      - name: Probe linuxdeploy
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          curl -fsSL -o /tmp/linuxdeploy.AppImage \
+            https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage
+          chmod +x /tmp/linuxdeploy.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 /tmp/linuxdeploy.AppImage --version
+          mkdir -p "$HOME/.cache/tauri"
+          cp /tmp/linuxdeploy.AppImage "$HOME/.cache/tauri/linuxdeploy-x86_64.AppImage"
 
       # sidecar runtime + shell bundle + 上传（release 由 create-release 建好）
       - name: Build shell bundle and upload

@@ -185,6 +185,8 @@ if (!args['upload-only']) {
     const pass = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD
       || (existsSync(PASS_PATH) ? readFileSync(PASS_PATH, 'utf8').trim() : '')
     const buildArgs = ['build', '--bundles', PLATFORMS[PLATFORM].bundles]
+    // linuxdeploy 失败时 tauri 只报一句笼统错误，verbose 才有 stderr。
+    if (PLATFORM.startsWith('linux')) buildArgs.push('--verbose')
     // --config <json>: override config at build time (e.g. point the updater
     // endpoint at a local dev server for E2E testing).
     if (args.config) buildArgs.push('--config', args.config)
