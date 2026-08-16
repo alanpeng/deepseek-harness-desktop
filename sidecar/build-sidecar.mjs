@@ -2,10 +2,13 @@
 // Build the dsh web host runtime directory for the desktop bundle.
 //
 // Pipeline:
-//   1. `pnpm deploy` materializes the desktop-runtime closure manifest
-//      (packages/desktop/desktop-runtime in the dsh clone) into a flat
-//      hoisted node_modules tree — no devDeps, peers listed explicitly.
-//   2. Assemble `sidecar/runtime/`: the deploy tree + a stock Node binary.
+//   1. `pnpm install --prod --frozen-lockfile` materializes the runtime
+//      closure from sidecar/runtime-manifest/package.json (all @deepseek-ai/*
+//      deps pinned to published npm versions — the closure used to come from
+//      `pnpm deploy` inside the upstream clone's packages/desktop, which is a
+//      LOCAL-ONLY directory that upstream master never had) into a flat
+//      hoisted node_modules tree.
+//   2. Assemble `sidecar/runtime/`: the installed tree + a stock Node binary.
 //      Tauri's `bundle.resources` ships this directory inside the installer
 //      as `dsh-runtime`, and the app spawns `node entry.mjs` from there.
 //   3. Pack `sidecar/dist/dsh-runtime-<v>-<platform>.tar.gz` (top-level
@@ -23,7 +26,7 @@
 //
 // Usage:
 //   node sidecar/build-sidecar.mjs [--platform windows-x86_64]
-//                                  [--node-from-exec] [--clone <dsh clone dir>]
+//                                  [--node-from-exec]
 //   --platform        windows-x86_64 (default) | macos-x86_64 |
 //                     macos-aarch64 | linux-x86_64
 //   --node-from-exec  copy process.execPath as the bundled node binary
@@ -31,21 +34,18 @@
 //                     and no download is needed). Without it, Windows uses
 //                     the well-known install path and other platforms fall
 //                     back to execPath too.
-//   --clone           dsh clone directory (CI checks out the runtime repo
-//                     separately). Defaults to ../deepseek-harness.
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)) // dsh-desktop/
 const args = parseArgs(process.argv.slice(2))
 const PLATFORM = args.platform || 'windows-x86_64'
-const CLONE = resolve(args.clone || join(ROOT, '..', 'deepseek-harness'))
-const RUNTIME_PKG = 'packages/desktop/desktop-runtime'
+const MANIFEST = join(ROOT, 'sidecar', 'runtime-manifest') // package.json + entry.mjs
 const STAGING = join(ROOT, 'sidecar', 'staging')
-const RUNTIME_DIR = join(STAGING, 'dsh-desktop-runtime') // pnpm deploy names the target after the package
+const RUNTIME_DIR = join(STAGING, 'dsh-desktop-runtime') // install target, then copied to RUNTIME_OUT
 const RUNTIME_OUT = join(ROOT, 'sidecar', 'runtime') // what the installer ships as dsh-runtime
 const DIST = join(ROOT, 'sidecar', 'dist')
 
@@ -68,9 +68,28 @@ const TAR = process.platform === 'win32' ? 'C:\\Windows\\System32\\tar.exe' : 't
 // JS entry via the current node instead. On unix, pnpm is a plain executable
 // on PATH (corepack / pnpm install) and execFileSync handles it directly.
 const NODE = process.execPath
-const PNPM_ENTRY = process.platform === 'win32'
-  ? join(process.env.APPDATA, 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
-  : 'pnpm'
+const PNPM_ENTRY = process.platform === 'win32' ? findPnpmEntry() : 'pnpm'
+
+// Where npm -g put pnpm on Windows: user-global (%APPDATA%\npm) on dev
+// machines, but CI windows runners install npm packages next to node itself
+// (hostedtoolcache layout) — probe both, then ask npm as a last resort.
+function findPnpmEntry() {
+  const candidates = [
+    join(process.env.APPDATA || '', 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'),
+    join(dirname(process.execPath), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'),
+  ]
+  const found = candidates.find((p) => existsSync(p))
+  if (found) return found
+  const npmCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+  if (existsSync(npmCli)) {
+    try {
+      const prefix = execFileSync(NODE, [npmCli, 'prefix', '-g'], { encoding: 'utf8' }).trim()
+      const p = join(prefix, 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
+      if (existsSync(p)) return p
+    } catch {}
+  }
+  throw new Error('pnpm 未找到：请先 npm install -g pnpm@11（Windows 需要 pnpm.mjs 文件路径）')
+}
 
 function fail(msg) {
   console.error(`[build-sidecar] ${msg}`)
@@ -118,23 +137,24 @@ function resolveNodeBinary() {
   return process.execPath
 }
 
-// ── 1. deploy the closure ────────────────────────────────────────────────
-console.log(`[1/4] Deploying desktop-runtime closure (platform ${PLATFORM})`)
+// ── 1. install the closure from the committed manifest ───────────────────
+console.log(`[1/4] Installing runtime closure (platform ${PLATFORM})`)
 rmSync(STAGING, { recursive: true, force: true })
 mkdirSync(STAGING, { recursive: true })
-// pnpm 11 deploy: `--filter=<package name>` selects the project, `--legacy`
-// opts out of the injected-workspace requirement (this workspace does not set
-// inject-workspace-packages), the target dir is the only positional arg.
-run(['--dir', CLONE,
-  '--filter=dsh-desktop-runtime',
-  'deploy',
-  '--legacy',
-  '--prod',
-  '--config.node-linker=hoisted',
-  '--config.auto-install-peers=false',
-  '--config.link-workspace-packages=true',
-  RUNTIME_DIR,
-])
+cpSync(MANIFEST, RUNTIME_DIR, { recursive: true })
+// pnpm install --prod: no devDeps, hoisted layout (the app resolves
+// node_modules flat, same as the old pnpm deploy tree). --frozen-lockfile
+// pins the resolution to the committed pnpm-lock.yaml (update it by running
+// `pnpm install` in sidecar/runtime-manifest after bumping a dependency).
+// auto-install-peers=false: several @deepseek-ai/* peers were never published
+// to npm (e.g. @deepseek-ai/dsh-bash, a peer of dsh-bash-local) — the closure
+// check below still fails the build if any actually-needed package is missing.
+// confirmModulesPurge=false: the copied manifest tree may carry a stale
+// node_modules (e.g. a local `pnpm install` in runtime-manifest), which pnpm
+// wants to purge — but it refuses without a TTY unless told otherwise. CI
+// sets CI=true and skips the prompt, so this only matters for local runs.
+run(['--dir', RUNTIME_DIR, 'install', '--prod', '--node-linker=hoisted',
+  '--config.auto-install-peers=false', '--config.confirmModulesPurge=false', '--frozen-lockfile'])
 
 // Sanity: the peers the web profile relies on must exist in the deployed tree.
 for (const pkg of ['@deepseek-ai/dsh-shell-env', '@deepseek-ai/dsh-invariants', '@deepseek-ai/dsh-web-app']) {
@@ -179,7 +199,25 @@ function checkClosure(root) {
     }
   }
   walk(modules)
-  const hard = [...missing.entries()].filter(([name]) => name.startsWith('@deepseek-ai/'))
+  // These @deepseek-ai packages are peers of installed plugins that were NEVER
+  // published to npm (npm view → 404; upstream workspace-internal names):
+  //   dsh-bash        <- dsh-bash-local            (bash backend, desktop
+  //                                                  profile loads dsh-shell,
+  //                                                  not dsh-bash-local)
+  //   dsh-user-id     <- dsh-command-feedback / dsh-session-telemetry-otel
+  //   dsh-retention   <- dsh-spill-policy
+  //   dsh-environment <- dsh-web-search-deepseek
+  // The 0.1.0 deploy tree (pnpm deploy + auto-install-peers=false) lacked them
+  // too and shipped fine — cordis only imports peers when the profile actually
+  // loads the plugin, and the desktop profile loads none of these. Accepted
+  // deliberately; everything published must exist.
+  const KNOWN_UNPUBLISHED = new Set([
+    '@deepseek-ai/dsh-bash',
+    '@deepseek-ai/dsh-user-id',
+    '@deepseek-ai/dsh-retention',
+    '@deepseek-ai/dsh-environment',
+  ])
+  const hard = [...missing.entries()].filter(([name]) => name.startsWith('@deepseek-ai/') && !KNOWN_UNPUBLISHED.has(name))
   if (hard.length) {
     const lines = hard.map(([name, from]) => `  ${name} <- ${[...from].join(', ')}`).join('\n')
     throw new Error(`deployed closure is missing @deepseek-ai packages — add them to desktop-runtime/package.json:\n${lines}`)

@@ -23,10 +23,6 @@ on:
       notes:
         description: '发布说明（Release body）'
         required: false
-      runtime-ref:
-        description: 'deepseek-harness 克隆的分支/tag'
-        required: false
-        default: 'master'
 
 permissions:
   contents: write
@@ -74,11 +70,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Intel runner：macos-15（退役后换成仍维护的 x64 标签）
-          # macOS arm64：macos-latest（若仍是 x64，换成 Apple Silicon 标签）
-          # 两者都有 arch sanity 步骤兜底，平台后缀与 runner 不匹配会直接失败
+          # 2026-08: GitHub 标准 macOS runner 已全部 Apple Silicon（macos-15
+          # 实测也是 arm64），无免费 Intel runner —— macos-x86_64 暂不发布。
+          # arch sanity 步骤兜底平台后缀与 runner 不匹配的情况。
           - { os: windows-latest, platform: windows-x86_64, bundles: nsis }
-          - { os: macos-15, platform: macos-x86_64, bundles: app,dmg }
           - { os: macos-latest, platform: macos-aarch64, bundles: app,dmg }
           - { os: ubuntu-latest, platform: linux-x86_64, bundles: deb,appimage }
     env:
@@ -86,15 +81,6 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v5
-
-      # 上游 dsh 源码在 deepseek-ai 组织下（公开仓库，默认分支 master），
-      # 不是 alanpeng/deepseek-harness —— 写错组织名会 404 not found。
-      - name: Checkout deepseek-harness (runtime source)
-        uses: actions/checkout@v5
-        with:
-          repository: deepseek-ai/deepseek-harness
-          path: deepseek-harness
-          ref: ${{ github.event.inputs.runtime-ref || 'master' }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -136,7 +122,6 @@ jobs:
             --fragment \
             --release-tag "v${{ needs.version.outputs.version }}" \
             --node-from-exec \
-            --clone "${{ github.workspace }}/deepseek-harness" \
             --notes "${{ github.event.inputs.notes }}"
         env:
           GITHUB_TOKEN: ${{ github.token }}

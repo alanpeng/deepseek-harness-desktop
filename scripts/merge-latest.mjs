@@ -28,7 +28,8 @@ if (!TOKEN) fail('GITHUB_TOKEN 未设置（repo scope）')
 
 // Every platform the shell updater can ask for — CI must produce all of them,
 // or a client on that platform silently never finds updates.
-const REQUIRED = ['windows-x86_64-nsis', 'windows-x86_64', 'macos-x86_64', 'macos-aarch64', 'linux-x86_64']
+// (macos-x86_64 absent: GitHub has no free Intel macOS runner as of 2026-08.)
+const REQUIRED = ['windows-x86_64-nsis', 'windows-x86_64', 'macos-aarch64', 'linux-x86_64']
 
 function fail(msg) {
   console.error(`[merge-latest] ${msg}`)
@@ -52,7 +53,7 @@ function parseArgs(argv) {
 const platforms = {}
 let notes = null
 let pub_date = null
-for (const f of ['windows-x86_64', 'macos-x86_64', 'macos-aarch64', 'linux-x86_64']) {
+for (const f of ['windows-x86_64', 'macos-aarch64', 'linux-x86_64']) {
   const path = join(FRAG_DIR, `latest-${f}.json`)
   if (!existsSync(path)) fail(`缺少 fragment: ${path}（对应 build job 未产出）`)
   const frag = JSON.parse(readFileSync(path, 'utf8'))

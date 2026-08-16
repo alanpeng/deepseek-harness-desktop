@@ -1,0 +1,17 @@
+# Standalone workspace root: keeps pnpm install for this manifest independent
+# of the dsh-desktop workspace above (which has its own pnpm-workspace.yaml +
+# lockfile). Without this file pnpm walks up and resolves against the parent
+# workspace, silently installing nothing here.
+packages: []
+
+# pnpm 11 ignores dependency build scripts by default; approve the ones the
+# runtime actually needs at boot. node-pty / koffi are native modules (their
+# postinstall compiles/links the .node binary), dsh-subprocess-local installs
+# its spawn helper. If a new ignored build shows up in `pnpm install`, add it
+# here deliberately — see ERR_PNPM_IGNORED_BUILDS.
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': true
+  '@google/genai': true
+  koffi: true
+  node-pty: true
+  protobufjs: true
