@@ -169,9 +169,13 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
     let plat = platform_suffix();
     let tag = format!("dsh-runtime-{target}-{plat}");
     let base = artifact_base_url();
+    // 三件套 URL 都必须带 {tag}/ 目录段：GitHub release 资产路径是
+    // {base}/{release_tag}/{asset_name}。sha/sig 曾漏掉目录段（自 ce8b5fc
+    // 起），拼成 {base}/{tag}.tar.gz.sha256 —— release tag 不存在 → 404，
+    // 自动更新永远卡在 gz 下载成功后、校验文件下载失败处。
     let gz_url = format!("{base}/{tag}/{tag}.tar.gz");
-    let sha_url = format!("{base}/{tag}.tar.gz.sha256");
-    let sig_url = format!("{base}/{tag}.tar.gz.minisig");
+    let sha_url = format!("{base}/{tag}/{tag}.tar.gz.sha256");
+    let sig_url = format!("{base}/{tag}/{tag}.tar.gz.minisig");
     let gz_path = staging.join(format!("{tag}.tar.gz"));
     let sha_path = staging.join(format!("{tag}.tar.gz.sha256"));
     let sig_path = staging.join(format!("{tag}.tar.gz.minisig"));
