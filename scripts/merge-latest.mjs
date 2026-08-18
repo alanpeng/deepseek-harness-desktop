@@ -43,7 +43,8 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2)
       const next = argv[i + 1]
-      if (next && !next.startsWith('--')) { out[key] = next; i++ } else out[key] = true
+      // 空串是合法值，不能当 flag 解析成 true（曾致 notes: true）
+      if (next !== undefined && !next.startsWith('--')) { out[key] = next; i++ } else out[key] = true
     }
   }
   return out
@@ -58,7 +59,7 @@ for (const f of ['windows-x86_64', 'macos-aarch64', 'linux-x86_64']) {
   if (!existsSync(path)) fail(`缺少 fragment: ${path}（对应 build job 未产出）`)
   const frag = JSON.parse(readFileSync(path, 'utf8'))
   if (frag.version !== VERSION) fail(`fragment ${f} 版本 ${frag.version} ≠ ${VERSION} —— build 与 finalize 版本不一致`)
-  if (frag.notes) notes ||= frag.notes
+  if (typeof frag.notes === 'string' && frag.notes) notes ||= frag.notes
   if (frag.pub_date) pub_date ||= frag.pub_date
   for (const [key, entry] of Object.entries(frag.platforms)) platforms[key] = entry
 }
@@ -68,7 +69,8 @@ if (missing.length) fail(`合并后缺少平台条目: ${missing.join(', ')}`)
 
 const manifest = {
   version: VERSION,
-  notes,
+  // notes 恒为 string：tauri updater 要求 string，null/boolean 反序列化失败
+  notes: notes || `dsh-desktop v${VERSION}`,
   pub_date: pub_date || new Date().toISOString(),
   platforms,
 }

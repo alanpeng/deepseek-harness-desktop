@@ -70,7 +70,9 @@ if (!process.env.TAURI_SIGNING_PRIVATE_KEY && !process.env.TAURI_SIGNING_PRIVATE
   if (!existsSync(KEY_PATH)) fail(`签名密钥不存在: ${KEY_PATH}（或用 TAURI_SIGNING_PRIVATE_KEY 环境变量）`)
 }
 
-const NOTES = args['notes'] || (args['notes-file'] && existsSync(args['notes-file']) ? readFileSync(args['notes-file'], 'utf8') : '')
+// notes 恒为 string（tauri updater 的 latest.json 要求 string，null/boolean 会反序列化失败）；
+// 未提供时兜底为 "dsh-desktop v<version>"
+const NOTES = args['notes'] || (args['notes-file'] && existsSync(args['notes-file']) ? readFileSync(args['notes-file'], 'utf8') : '') || `dsh-desktop v${VERSION}`
 
 function fail(msg) {
   console.error(`[release-desktop] ${msg}`)
@@ -84,7 +86,10 @@ function parseArgs(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2)
       const next = argv[i + 1]
-      if (next && !next.startsWith('--')) { out[key] = next; i++ } else out[key] = true
+      // 空串是合法值（--notes ""），不能当 flag 解析成 true ——
+      // 曾导致 latest.json 出现 "notes": true，tauri updater 报
+      // "invalid type: boolean 'true', expected a string"
+      if (next !== undefined && !next.startsWith('--')) { out[key] = next; i++ } else out[key] = true
     }
   }
   return out
