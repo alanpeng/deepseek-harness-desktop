@@ -104,7 +104,11 @@ jobs:
           cd sidecar/runtime-manifest
           # --config.minimum-release-age=0: pnpm 11 默认 24h 供应链截断，
           # 会把刚发布的官方 rc 判为"太新"直接拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）
-          pnpm install --lockfile-only --config.confirmModulesPurge=false --config.minimum-release-age=0
+          # --config.auto-install-peers=false: 与 build-sidecar.mjs 的 staging
+          # install 保持一致。pnpm 11 把 autoInstallPeers 写进 lockfile 的
+          # settings 块，frozen-lockfile 安装时配置不匹配直接
+          # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH（rc.7 三平台 runtime job 全灭根因）
+          pnpm install --lockfile-only --config.confirmModulesPurge=false --config.minimum-release-age=0 --config.auto-install-peers=false
           cd ../..
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
