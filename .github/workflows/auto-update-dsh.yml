@@ -40,6 +40,11 @@ jobs:
       - name: Check npm for acceptable dsh release
         id: bump
         shell: bash
+        env:
+          # artifacts 检查要跨仓库读 deepseek-harness-runtime：
+          # GITHUB_TOKEN 作用域仅限本仓库，跨仓库 API 一律 401（即使目标
+          # public）→ 曾致每小时误判缺失、反复 rebuild rc.7。
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           LATEST="$(npm view @deepseek-ai/dsh versions --json | node -e '
             const vs = JSON.parse(require("fs").readFileSync(0, "utf8"))
@@ -71,9 +76,9 @@ jobs:
             MISSING=""
             for PLAT in windows-x86_64 macos-aarch64 linux-x86_64; do
               CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Authorization: Bearer $GH_PAT" \
                 "https://api.github.com/repos/alanpeng/deepseek-harness-runtime/releases/tags/dsh-runtime-$LATEST-$PLAT")
-              if [ "$CODE" != "200" ]; then MISSING="$MISSING $PLAT"; fi
+              if [ "$CODE" != "200" ]; then echo "  $PLAT: HTTP $CODE"; MISSING="$MISSING $PLAT"; fi
             done
             if [ -z "$MISSING" ]; then
               echo "已是 $LATEST 且 runtime artifacts 齐全，无需更新"
