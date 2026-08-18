@@ -15,3 +15,9 @@ allowBuilds:
   koffi: true
   node-pty: true
   protobufjs: true
+
+# pnpm 11's default minimumReleaseAge (24h supply-chain cutoff) rejects
+# freshly published official rc releases — our auto-update tracks rc
+# releases within minutes, so the policy fights the mechanism. Disabled
+# explicitly; do not remove.
+minimumReleaseAge: 0
