@@ -96,9 +96,13 @@ jobs:
               fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n")
             })()
           '
-          # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）
+          # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）。
+          # 直接调 PATH 里的 pnpm：`$(dirname $(command -v pnpm))/node_modules/...`
+          # 是 Windows 专属绕法（npm -g 布局差异），在 Linux runner 上
+          # command -v pnpm 是 symlink，拼出的路径不存在，node 直接 ENOENT
+          # （rc.7 是首次真正走到这行，之前全是"无新版本"提前 exit 0）。
           cd sidecar/runtime-manifest
-          node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --lockfile-only --config.confirmModulesPurge=false
+          pnpm install --lockfile-only --config.confirmModulesPurge=false
           cd ../..
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
