@@ -63,16 +63,33 @@ jobs:
           fi
           CUR="$(node -p "require('./sidecar/runtime-manifest/package.json').dependencies['@deepseek-ai/dsh']")"
           if [ "$LATEST" = "$CUR" ]; then
-            echo "已是 $LATEST，无需更新"
-            exit 0
+            # 版本已最新：检查 runtime 仓库该版本三平台 artifacts 是否齐全。
+            # 缺失（构建失败/上传中断）→ 重建发布；齐全 → 无事可做。
+            # 这给了发布失败自愈路径：cron 每小时重试，直到三平台收敛。
+            # （GitHub rerun-failed-jobs 只重跑原 head_sha，不含后续修复，
+            # 不能依赖它补发；此检查使同版本重建也能走完整构建。）
+            MISSING=""
+            for PLAT in windows-x86_64 macos-aarch64 linux-x86_64; do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                "https://api.github.com/repos/alanpeng/deepseek-harness-runtime/releases/tags/dsh-runtime-$LATEST-$PLAT")
+              if [ "$CODE" != "200" ]; then MISSING="$MISSING $PLAT"; fi
+            done
+            if [ -z "$MISSING" ]; then
+              echo "已是 $LATEST 且 runtime artifacts 齐全，无需更新"
+              exit 0
+            fi
+            echo "已是 $LATEST 但 runtime artifacts 缺失（$MISSING），重新构建发布"
+          else
+            echo "发现新版 $LATEST（当前 $CUR），开始 bump…"
           fi
-          echo "发现新版 $LATEST（当前 $CUR），开始 bump…"
           # bump dsh 及全部 @deepseek-ai/* 子包到各自最高可接受版本。
           # 官方按 workspace 同步发版（dsh 0.1.0-rc.6 时子包同发 0.1.0-rc.6）；
           # 只升 dsh 会把闭包变成"新 dsh + 旧插件"混装 —— v0.1.1 事故根源：
           # dsh-subprocess-local@0.1.0-rc.6 需要 SubprocessRuntime 导出，
           # 而 dsh-subprocess 停在 0.0.1-rc.1（npm latest tag 误导）没有该导出。
           # 过滤规则与上方一致：只接受 x.y.z / x.y.z-rc.N，dev/alpha/beta 忽略。
+          # 版本未变时（重建路径）此脚本不改任何版本，仅幂等。
           node -e '
             const fs = require("fs")
             const p = "sidecar/runtime-manifest/package.json"
@@ -113,7 +130,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sidecar/runtime-manifest/package.json sidecar/runtime-manifest/pnpm-lock.yaml
-          git commit -m "chore(runtime): bump @deepseek-ai/dsh to $LATEST"
+          # 重建路径（版本未变）下 lockfile 可能无 diff，--allow-empty 保证
+          # 有 commit 从而 changed=true；cron 每小时最多补一个空 commit，
+          # artifacts 齐全后 gate 提前退出，不再产生。
+          if git diff --cached --quiet; then
+            git commit --allow-empty -m "chore(runtime): rebuild $LATEST artifacts"
+          else
+            git commit -m "chore(runtime): bump @deepseek-ai/dsh to $LATEST"
+          fi
           git push
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
