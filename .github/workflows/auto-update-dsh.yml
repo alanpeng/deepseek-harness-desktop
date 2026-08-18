@@ -102,7 +102,9 @@ jobs:
           # command -v pnpm 是 symlink，拼出的路径不存在，node 直接 ENOENT
           # （rc.7 是首次真正走到这行，之前全是"无新版本"提前 exit 0）。
           cd sidecar/runtime-manifest
-          pnpm install --lockfile-only --config.confirmModulesPurge=false
+          # --config.minimum-release-age=0: pnpm 11 默认 24h 供应链截断，
+          # 会把刚发布的官方 rc 判为"太新"直接拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）
+          pnpm install --lockfile-only --config.confirmModulesPurge=false --config.minimum-release-age=0
           cd ../..
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -139,13 +141,15 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm@11
 
+      # --config.minimum-release-age=0：根 workspace 的 install 解析 bump 后
+      # 的 rc 包，pnpm 11 默认 24h 供应链截断会拒绝刚发布的官方 rc
       - name: Install workspace deps
         shell: bash
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then
-            node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile
+            node "$(dirname "$(command -v pnpm)")/node_modules/pnpm/bin/pnpm.mjs" install --frozen-lockfile --config.minimum-release-age=0
           else
-            pnpm install --frozen-lockfile
+            pnpm install --frozen-lockfile --config.minimum-release-age=0
           fi
 
       # build-sidecar（含 koffi musl 修剪）+ signer 签名 + 上传。
