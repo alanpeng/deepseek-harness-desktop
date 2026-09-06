@@ -118,6 +118,14 @@ jobs:
               fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n")
             })()
           '
+          # 闭包自愈：官方新版本可能引入此前未声明的 @deepseek-ai 包
+          # （0.1.2-rc.1 引入 dsh-attachment/dsh-jobs 等 7 个）。上面只升
+          # 已声明依赖，漏掉新进闭包的包 → build-sidecar 完整性 gate 三平台
+          # 全挂，cron 每小时空转 rebuild 直到人工补包（rc.1 的
+          # dsh-authorization、0.1.2-rc.1 的 7 个包各卡一次）。此脚本
+          # materialize 闭包跑同一扫描，缺失且 npm 上存在的包以最高可接受
+          # 版本声明进 manifest；幂等，闭包完整时不改任何文件直接早退。
+          node scripts/complete-closure.mjs
           # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）。
           # 直接调 PATH 里的 pnpm：`$(dirname $(command -v pnpm))/node_modules/...`
           # 是 Windows 专属绕法（npm -g 布局差异），在 Linux runner 上

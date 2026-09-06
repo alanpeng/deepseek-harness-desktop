@@ -37,8 +37,9 @@
 
 import { execFileSync, spawnSync } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolvePnpmEntry, scanMissing, KNOWN_UNPUBLISHED } from './closure-check.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)) // dsh-desktop/
 const args = parseArgs(process.argv.slice(2))
@@ -62,34 +63,13 @@ if (!PLATFORMS[PLATFORM]) fail(`未知平台 ${PLATFORM}（可用: ${Object.keys
 // Archive tool: libarchive bsdtar ships as tar.exe with Windows, `tar` on unix.
 const TAR = process.platform === 'win32' ? 'C:\\Windows\\System32\\tar.exe' : 'tar'
 
-// Windows: never spawn `pnpm` by bare name — under Git Bash the PATH
-// entries are POSIX shell scripts that CreateProcess refuses (EINVAL), and
-// the .cmd shims are equally unreliable through execFileSync. Invoke the real
-// JS entry via the current node instead. On unix, pnpm is a plain executable
-// on PATH (corepack / pnpm install) and execFileSync handles it directly.
+// Windows: never spawn `pnpm` by bare name — the shared resolver in
+// closure-check.mjs handles the .cmd-shim / CreateProcess pitfalls (see
+// resolvePnpmEntry there for the hostedtoolcache layout probing).
 const NODE = process.execPath
-const PNPM_ENTRY = process.platform === 'win32' ? findPnpmEntry() : 'pnpm'
-
-// Where npm -g put pnpm on Windows: user-global (%APPDATA%\npm) on dev
-// machines, but CI windows runners install npm packages next to node itself
-// (hostedtoolcache layout) — probe both, then ask npm as a last resort.
-function findPnpmEntry() {
-  const candidates = [
-    join(process.env.APPDATA || '', 'npm', 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'),
-    join(dirname(process.execPath), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'),
-  ]
-  const found = candidates.find((p) => existsSync(p))
-  if (found) return found
-  const npmCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
-  if (existsSync(npmCli)) {
-    try {
-      const prefix = execFileSync(NODE, [npmCli, 'prefix', '-g'], { encoding: 'utf8' }).trim()
-      const p = join(prefix, 'node_modules', 'pnpm', 'bin', 'pnpm.mjs')
-      if (existsSync(p)) return p
-    } catch {}
-  }
-  throw new Error('pnpm 未找到：请先 npm install -g pnpm@11（Windows 需要 pnpm.mjs 文件路径）')
-}
+const PNPM_ENTRY = process.platform === 'win32'
+  ? (resolvePnpmEntry() || fail('pnpm 未找到：请先 npm install -g pnpm@11（Windows 需要 pnpm.mjs 文件路径）'))
+  : 'pnpm'
 
 function fail(msg) {
   console.error(`[build-sidecar] ${msg}`)
@@ -167,62 +147,16 @@ if (!existsSync(join(RUNTIME_DIR, 'entry.mjs'))) throw new Error(`deployed closu
 // (auto-install-peers=false). Any @deepseek-ai/* package that some deployed
 // package statically depends on must be declared explicitly in the runtime
 // manifest, or the loader dies at boot (ERR_MODULE_NOT_FOUND at import time).
-checkClosure(RUNTIME_DIR)
-
+// The scan itself lives in closure-check.mjs — scripts/complete-closure.mjs
+// (auto-update workflow) runs the same scan to auto-declare new packages.
 function checkClosure(root) {
-  const modules = join(root, 'node_modules')
-  const present = new Set()
-  for (const f of readdirSync(modules)) {
-    if (f.startsWith('@')) {
-      for (const g of readdirSync(join(modules, f))) present.add(`${f}/${g}`)
-    } else present.add(f)
-  }
-  const missing = new Map() // name -> Set of declaring packages
-  const walk = (dir) => {
-    for (const entry of readdirSync(dir, { withFileTypes: true })) {
-      const p = join(dir, entry.name)
-      if (!entry.isDirectory()) continue
-      const pjPath = join(p, 'package.json')
-      if (!existsSync(pjPath)) { walk(p); continue }
-      const pj = JSON.parse(readFileSync(pjPath, 'utf8'))
-      // optionalDependencies may legitimately be absent (platform variants).
-      for (const [kind, deps] of [['dependencies', pj.dependencies], ['peers', pj.peerDependencies]]) {
-        if (!deps) continue
-        for (const name of Object.keys(deps)) {
-          const scoped = name.startsWith('@') && name.includes('/') ? name.split('/').slice(0, 2).join('/') : name
-          if (!present.has(scoped)) {
-            if (!missing.has(name)) missing.set(name, new Set())
-            missing.get(name).add(pj.name)
-          }
-        }
-      }
-    }
-  }
-  walk(modules)
-  // These @deepseek-ai packages are peers of installed plugins that were NEVER
-  // published to npm (npm view → 404; upstream workspace-internal names):
-  //   dsh-bash        <- dsh-bash-local            (bash backend, desktop
-  //                                                  profile loads dsh-shell,
-  //                                                  not dsh-bash-local)
-  //   dsh-user-id     <- dsh-command-feedback / dsh-session-telemetry-otel
-  //   dsh-retention   <- dsh-spill-policy
-  //   dsh-environment <- dsh-web-search-deepseek
-  // The 0.1.0 deploy tree (pnpm deploy + auto-install-peers=false) lacked them
-  // too and shipped fine — cordis only imports peers when the profile actually
-  // loads the plugin, and the desktop profile loads none of these. Accepted
-  // deliberately; everything published must exist.
-  const KNOWN_UNPUBLISHED = new Set([
-    '@deepseek-ai/dsh-bash',
-    '@deepseek-ai/dsh-user-id',
-    '@deepseek-ai/dsh-retention',
-    '@deepseek-ai/dsh-environment',
-  ])
-  const hard = [...missing.entries()].filter(([name]) => name.startsWith('@deepseek-ai/') && !KNOWN_UNPUBLISHED.has(name))
+  const missing = scanMissing(join(root, 'node_modules'))
+  const hard = missing.filter(([name]) => name.startsWith('@deepseek-ai/') && !KNOWN_UNPUBLISHED.has(name))
   if (hard.length) {
-    const lines = hard.map(([name, from]) => `  ${name} <- ${[...from].join(', ')}`).join('\n')
+    const lines = hard.map(([name, from]) => `  ${name} <- ${from.join(', ')}`).join('\n')
     throw new Error(`deployed closure is missing @deepseek-ai packages — add them to desktop-runtime/package.json:\n${lines}`)
   }
-  for (const [name, from] of missing) console.warn(`  ! missing optional/registry dep ${name} (${[...from].join(', ')}) — ignored`)
+  for (const [name, from] of missing) console.warn(`  ! missing optional/registry dep ${name} (${from.join(', ')}) — ignored`)
 }
 
 // ── 2. assemble the runtime dir ──────────────────────────────────────────
