@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.0"
+version = "0.1.6"
 description = "Desktop shell for DeepSeek Harness (dsh) — Tauri 2 + Node sidecar"
 edition = "2021"
 
