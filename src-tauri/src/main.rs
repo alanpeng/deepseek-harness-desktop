@@ -4,6 +4,7 @@
 mod deep_link;
 mod host;
 mod runtime_update;
+mod session_repair;
 mod tray;
 mod updates;
 

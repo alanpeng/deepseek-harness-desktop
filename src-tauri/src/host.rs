@@ -162,7 +162,7 @@ fn parse_dsh_version(json: &str) -> Option<(u32, u32, u32)> {
 /// Read the dsh package version of the runtime this build will spawn — dev:
 /// the clone's workspace install (pnpm links it under root node_modules);
 /// release: the bundled/overlay runtime tree, same layout start_host spawns.
-fn runtime_dsh_version(app: &AppHandle) -> Option<(u32, u32, u32)> {
+pub(crate) fn runtime_dsh_version(app: &AppHandle) -> Option<(u32, u32, u32)> {
     let pj = if cfg!(debug_assertions) {
         dev_clone_dir()
             .join("node_modules")
@@ -250,6 +250,12 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         let state = app.state::<HostState>();
         *state.web_url.lock().unwrap() = None;
     }
+
+    // Heal encoding-incompatible session artifacts (legacy plaintext files
+    // under a zstd root crash the 0.1.0+ host at boot) before it spawns. This
+    // is the single spawn choke point: runtime self-update restarts go through
+    // restart_host → start_host too, so every start is covered.
+    crate::session_repair::repair_session_root(app);
 
     let mut command = if cfg!(debug_assertions) {
         // Dev: run the CLI bin from the dsh clone under the system Node.

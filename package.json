@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Desktop shell for DeepSeek Harness (dsh) — Tauri 2 + Node sidecar",
   "scripts": {
