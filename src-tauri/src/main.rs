@@ -52,11 +52,10 @@ fn main() {
             }
             match host::start_host(app.handle()) {
                 Ok(port) => {
-                    let url = format!("http://127.0.0.1:{port}").parse().unwrap();
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.navigate(url);
-                        let _ = window.show();
-                    }
+                    // Navigate on the sidecar's `dsh web:` announce — the URL
+                    // carries the 0.1.2+ launch token, which the bare address
+                    // would 401 without.
+                    host::navigate_web(app.handle(), port);
                 }
                 Err(err) => {
                     eprintln!("[dsh-desktop] host start failed: {err}");

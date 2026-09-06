@@ -49,6 +49,9 @@ pub struct HostState {
     pub port: Mutex<Option<u16>>,
     /// Live host child process, if any.
     pub child: Mutex<Option<CommandChild>>,
+    /// Web URL announced by the sidecar's `dsh web:` line (token-carrying on
+    /// 0.1.2+, bare on older hosts). None until that line is seen.
+    pub web_url: Mutex<Option<String>>,
     /// Set when the user chose to quit; window close then exits instead of hiding.
     pub quitting: AtomicBool,
 }
@@ -58,6 +61,7 @@ impl Default for HostState {
         Self {
             port: Mutex::new(None),
             child: Mutex::new(None),
+            web_url: Mutex::new(None),
             quitting: AtomicBool::new(false),
         }
     }
@@ -120,6 +124,67 @@ pub fn runtime_overlay_dir() -> PathBuf {
     data_root().join("dsh-desktop").join("dsh-runtime")
 }
 
+/// Dev-mode clone location (see start_host). Shared with the version probe.
+fn dev_clone_dir() -> PathBuf {
+    std::env::var("DSH_DESKTOP_CLONE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("deepseek-harness")
+        })
+}
+
+/// Parse `(major, minor, patch)` from a package.json's `"version"` field.
+/// Segment 3 may carry a prerelease suffix (e.g. `0.1.2-rc.1`) — only the
+/// leading digits are read. `None` when no parseable version is found.
+fn parse_dsh_version(json: &str) -> Option<(u32, u32, u32)> {
+    let mut rest = json;
+    while let Some(at) = rest.find("\"version\"") {
+        rest = &rest[at + "\"version\"".len()..];
+        let after = rest.trim_start_matches(|c: char| c.is_whitespace());
+        let Some(after_colon) = after.strip_prefix(':') else { continue };
+        let quoted = after_colon.trim_start_matches(|c: char| c.is_whitespace());
+        let Some(after_quote) = quoted.strip_prefix('"') else { continue };
+        let end = after_quote.find('"')?;
+        let seg = |s: &str| -> Option<u32> {
+            let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse().ok()
+        };
+        let mut parts = after_quote[..end].split('.');
+        let (maj, min, pat) = (seg(parts.next()?)?, seg(parts.next()?)?, seg(parts.next()?)?);
+        return Some((maj, min, pat));
+    }
+    None
+}
+
+/// Read the dsh package version of the runtime this build will spawn — dev:
+/// the clone's workspace install (pnpm links it under root node_modules);
+/// release: the bundled/overlay runtime tree, same layout start_host spawns.
+fn runtime_dsh_version(app: &AppHandle) -> Option<(u32, u32, u32)> {
+    let pj = if cfg!(debug_assertions) {
+        dev_clone_dir()
+            .join("node_modules")
+            .join("@deepseek-ai")
+            .join("dsh")
+            .join("package.json")
+    } else {
+        runtime_dir(app).ok()?.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json")
+    };
+    parse_dsh_version(&std::fs::read_to_string(pj).ok()?)
+}
+
+/// Whether the runtime about to spawn speaks the 0.1.2+ web contract:
+/// accepts `--no-open` and prints a token-carrying `dsh web:` URL.
+/// 0.1.2-rc.1 introduced the launch-token auth AND the flag together; older
+/// runtimes may reject unknown flags (commander is strict), so never pass
+/// `--no-open` to them — their bare-URL behavior is what the shell already
+/// targets. Missing/unreadable version metadata counts as old.
+fn runtime_auth_capable(app: &AppHandle) -> bool {
+    runtime_dsh_version(app).is_some_and(|(maj, min, pat)| (maj, min, pat) >= (0, 1, 2))
+}
+
 /// Append host sidecar output to `%APPDATA%\dsh-desktop\dsh-home\logs\host.log`.
 /// The GUI app has no console, so this file is the only place a clean-machine
 /// failure can be inspected after the fact.
@@ -159,21 +224,37 @@ pub fn wait_ready(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// Extract the web URL from a sidecar stdout line, if it announces OUR port.
+///
+/// 0.1.2+ hosts print `dsh web: http://127.0.0.1:<port>/?token=<X>` once their
+/// Loader tree settles — the readiness signal that the auth middleware is
+/// mounted and the launch token is available. Older hosts print the same line
+/// without the token query. The line may carry a ` (LAN: …)` suffix; the URL
+/// ends at the first whitespace.
+fn parse_web_url_line(line: &str, port: u16) -> Option<String> {
+    let marker = format!("http://127.0.0.1:{port}");
+    let start = line.find(&marker)?;
+    let rest = &line[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
 /// Spawn the dsh web host and return its port once it is listening.
 pub fn start_host(app: &AppHandle) -> Result<u16, String> {
     let port = pick_free_port();
 
+    // A previous process's announced URL must never leak into this launch —
+    // clear it before spawning so navigate_web only ever sees this child's
+    // `dsh web:` line (its token is process-scoped).
+    {
+        let state = app.state::<HostState>();
+        *state.web_url.lock().unwrap() = None;
+    }
+
     let mut command = if cfg!(debug_assertions) {
         // Dev: run the CLI bin from the dsh clone under the system Node.
         // Override the clone location with DSH_DESKTOP_CLONE when needed.
-        let clone = std::env::var("DSH_DESKTOP_CLONE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("..")
-                    .join("..")
-                    .join("deepseek-harness")
-            });
+        let clone = dev_clone_dir();
         let bin = clone.join("apps").join("cli").join("lib").join("bin.js");
         if !bin.exists() {
             return Err(format!(
@@ -214,14 +295,19 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
     };
 
     command = command
-        .args([
-            "--profile",
-            "web",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-        ])
+        .arg("--profile")
+        .arg("web")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string());
+    // 0.1.2+ hosts open the default browser after announcing unless told not
+    // to — wrong for a desktop shell whose window IS the browser. Gated on the
+    // runtime version: older runtimes may reject the unknown flag outright.
+    if runtime_auth_capable(app) {
+        command = command.arg("--no-open");
+    }
+    command = command
         .env("DSH_HOME", dsh_home().to_str().unwrap_or("."))
         .env("DSH_TELEMETRY_DISABLED", "1")
         .current_dir(user_home());
@@ -265,6 +351,16 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
                         let line = String::from_utf8_lossy(&line);
                         println!("[host] {line}");
                         record("host", &line);
+                        // The `dsh web:` announce (bare on old hosts, token-
+                        // carrying on 0.1.2+) is the readiness signal navigate_web
+                        // waits on — record the first one for our port.
+                        if let Some(url) = parse_web_url_line(&line, port) {
+                            let state = app2.state::<HostState>();
+                            let mut slot = state.web_url.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(url);
+                            }
+                        }
                     }
                     Some(CommandEvent::Stderr(line)) => {
                         let line = String::from_utf8_lossy(&line);
@@ -324,16 +420,108 @@ pub fn kill_host(app: &AppHandle) {
     }
 }
 
+/// Once the sidecar's `dsh web:` line arrives, navigate the window to it.
+///
+/// The 0.1.2+ launch token (`…/?token=…`) exists only in that line, and the
+/// line itself only prints after the Loader tree settles — i.e. once the auth
+/// middleware is mounted. Navigating before it would either race past auth
+/// (serving the index without minting the cookie, then 401 on any reload) or
+/// hit the bare-URL 401 wall head-on. Older hosts print the same line without
+/// a token, so the stored URL works for every runtime. Falls back to the bare
+/// URL after a timeout so a silent host still gets a window.
+pub fn navigate_web(app: &AppHandle, port: u16) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let state = app.state::<HostState>();
+        let deadline = std::time::Instant::now() + Duration::from_secs(45);
+        let url = loop {
+            {
+                let slot = state.web_url.lock().unwrap();
+                if let Some(url) = slot.clone() {
+                    break url;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("[dsh-desktop] no 'dsh web:' announce within 45s; navigating bare");
+                break format!("http://127.0.0.1:{port}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if let Some(window) = app.get_webview_window("main") {
+            if let Ok(parsed) = url.parse::<tauri::Url>() {
+                let _ = window.navigate(parsed);
+            }
+            let _ = window.show();
+        }
+    });
+}
+
 /// Kill, respawn, and re-navigate the window to the new host port.
 /// Shared by the tray "restart" item and the runtime hot-update swap.
 /// On failure the window is pointed at the splash error page.
 pub fn restart_host(app: &AppHandle) -> Result<u16, String> {
     kill_host(app);
     let port = start_host(app)?;
-    if let Some(window) = app.get_webview_window("main") {
-        let url = format!("http://127.0.0.1:{port}").parse().unwrap();
-        let _ = window.navigate(url);
-        let _ = window.show();
-    }
+    navigate_web(app, port);
     Ok(port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_token_url_line() {
+        let line = "dsh web: http://127.0.0.1:1852/?token=LElOpXIzwnSGLI2ej8qv99nSMo9X2C2ViDv2dR3jf8s";
+        assert_eq!(
+            parse_web_url_line(line, 1852),
+            Some("http://127.0.0.1:1852/?token=LElOpXIzwnSGLI2ej8qv99nSMo9X2C2ViDv2dR3jf8s".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_bare_url_line() {
+        // 0.1.1-era hosts announce without a token.
+        assert_eq!(
+            parse_web_url_line("dsh web: http://127.0.0.1:1852", 1852),
+            Some("http://127.0.0.1:1852".to_string())
+        );
+    }
+
+    #[test]
+    fn cuts_lan_suffix() {
+        let line = "dsh web: http://127.0.0.1:1852/?token=abc_XYZ-9 (LAN: http://10.0.0.4:1852/?token=abc_XYZ-9)";
+        assert_eq!(
+            parse_web_url_line(line, 1852),
+            Some("http://127.0.0.1:1852/?token=abc_XYZ-9".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_other_ports_and_unrelated_lines() {
+        assert_eq!(parse_web_url_line("dsh web: http://127.0.0.1:9999/?token=x", 1852), None);
+        assert_eq!(parse_web_url_line("loader: tree settled in 812ms", 1852), None);
+    }
+
+    #[test]
+    fn version_parses_prerelease_suffix() {
+        let pj = r#"{ "name": "@deepseek-ai/dsh", "version": "0.1.2-rc.1" }"#;
+        assert_eq!(parse_dsh_version(pj), Some((0, 1, 2)));
+        assert_eq!(parse_dsh_version(r#"{ "name": "@deepseek-ai/dsh", "version": "0.1.1-rc.2" }"#), Some((0, 1, 1)));
+        assert_eq!(parse_dsh_version(r#"{ "name": "@deepseek-ai/dsh", "version": "0.1.2-alpha.5" }"#), Some((0, 1, 2)));
+        assert_eq!(parse_dsh_version("not json"), None);
+        assert_eq!(parse_dsh_version(r#"{ "name": "@deepseek-ai/dsh" }"#), None);
+    }
+
+    #[test]
+    fn auth_capability_threshold() {
+        // Gate keeps old runtimes flag-free: anything below 0.1.2 is legacy.
+        let cap = |v: &str| parse_dsh_version(v).is_some_and(|(a, b, c)| (a, b, c) >= (0, 1, 2));
+        assert!(!cap(r#"{"version": "0.1.0-rc.6"}"#));
+        assert!(!cap(r#"{"version": "0.1.1-rc.2"}"#));
+        assert!(!cap(r#"{"version": "0.1.1"}"#));
+        assert!(cap(r#"{"version": "0.1.2-rc.1"}"#));
+        assert!(cap(r#"{"version": "0.1.3-alpha.1"}"#));
+        assert!(cap(r#"{"version": "0.2.0"}"#));
+    }
 }
