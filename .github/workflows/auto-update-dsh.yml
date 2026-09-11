@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.bump.outputs.changed }}
+      # runtime job 必须构建本次 bump 后的提交，故把该 commit 显式传出
+      sha: ${{ steps.bump.outputs.sha }}
     steps:
       - uses: actions/checkout@v5
 
@@ -167,6 +169,12 @@ jobs:
             git commit -m "chore(runtime): bump @deepseek-ai/dsh to $LATEST"
           fi
           git push
+          # runtime job 的 checkout 默认取 github.sha —— 那是**触发本次运行时的**
+          # 旧 HEAD，不含刚推的这个 bump，于是它静默构建并重发上一个版本（实测：
+          # 三个 runtime job head_sha 均为 bump 前提交，同时旧版资产被删掉重传）。
+          # 真实 bump 因此要等下一轮 cron 才收敛 —— 这就是历史"空转 rebuild"的真身。
+          # 显式把本次提交传给 runtime job，单轮即构建正确版本。
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
   # 三平台并行发布 runtime 资产（与 release.yml 的 runtime 步骤同逻辑，
@@ -186,11 +194,27 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
+      # ref 必须显式指定：checkout 默认取 github.sha = 触发本次运行时的旧 HEAD，
+      # 不含 check job 刚推的 bump → 会构建并重发上一个版本。
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check.outputs.sha }}
 
       - uses: actions/setup-node@v5
         with:
           node-version: 24
+
+      # 防静默回退：ref 传空时 checkout 会悄悄退回默认行为（旧 SHA）而不报错，
+      # 这正是该 bug 能藏这么久的原因。此处硬断言，宁可炸也不发错版本。
+      - name: Assert building the bumped commit
+        shell: bash
+        env:
+          EXPECTED: ${{ needs.check.outputs.sha }}
+        run: |
+          test -n "$EXPECTED" || { echo "::error::check job 未输出 sha，拒绝退回 github.sha"; exit 1; }
+          ACTUAL="$(git rev-parse HEAD)"
+          test "$ACTUAL" = "$EXPECTED" || { echo "::error::HEAD=$ACTUAL 与 check 产物 $EXPECTED 不一致"; exit 1; }
+          echo "building $ACTUAL (dsh $(node -p 'require("./sidecar/runtime-manifest/package.json").dependencies["@deepseek-ai/dsh"]'))"
 
       # 与 release.yml 相同：Windows 上 npm -g 的 pnpm 布局随 runner
       # 变化，用 command -v 动态解析（.cmd shim 在 execFileSync 下不可靠）
