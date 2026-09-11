@@ -125,21 +125,36 @@ jobs:
           # dsh-authorization、0.1.2-rc.1 的 7 个包各卡一次）。此脚本
           # materialize 闭包跑同一扫描，缺失且 npm 上存在的包以最高可接受
           # 版本声明进 manifest；幂等，闭包完整时不改任何文件直接早退。
-          node scripts/complete-closure.mjs
           # 更新 lockfile（--lockfile-only：只解析树，不装 node_modules）。
           # 直接调 PATH 里的 pnpm：`$(dirname $(command -v pnpm))/node_modules/...`
           # 是 Windows 专属绕法（npm -g 布局差异），在 Linux runner 上
           # command -v pnpm 是 symlink，拼出的路径不存在，node 直接 ENOENT
           # （rc.7 是首次真正走到这行，之前全是"无新版本"提前 exit 0）。
-          cd sidecar/runtime-manifest
           # --config.minimum-release-age=0: pnpm 11 默认 24h 供应链截断，
           # 会把刚发布的官方 rc 判为"太新"直接拒绝（ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION）
           # --config.auto-install-peers=false: 与 build-sidecar.mjs 的 staging
           # install 保持一致。pnpm 11 把 autoInstallPeers 写进 lockfile 的
           # settings 块，frozen-lockfile 安装时配置不匹配直接
           # ERR_PNPM_LOCKFILE_CONFIG_MISMATCH（rc.7 三平台 runtime job 全灭根因）
-          pnpm install --lockfile-only --config.confirmModulesPurge=false --config.minimum-release-age=0 --config.auto-install-peers=false
-          cd ../..
+          sync_lockfile() {
+            (
+              cd sidecar/runtime-manifest
+              pnpm install --lockfile-only --config.confirmModulesPurge=false --config.minimum-release-age=0 --config.auto-install-peers=false
+            )
+          }
+          # 顺序敏感：上面 bump 已改写 package.json，而 complete-closure 会用
+          # --frozen-lockfile 物化闭包 —— lockfile 必须先重解析，否则
+          # ERR_PNPM_OUTDATED_LOCKFILE 直接炸在第 5 步：changed 永不置位、
+          # runtime job 被 skip，runtime 仓库永远停在旧版本。
+          # （5f300ec 引入 complete-closure 后无新版本可做，首次真实 bump
+          # 0.1.5-rc.1 才暴露；此后每小时同一处复炸。）
+          sync_lockfile
+
+          node scripts/complete-closure.mjs
+
+          # 若闭包自愈声明了新包（package.json 再次变化），需再同步一次 lockfile；
+          # 无新增时是幂等空操作。
+          sync_lockfile
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add sidecar/runtime-manifest/package.json sidecar/runtime-manifest/pnpm-lock.yaml
