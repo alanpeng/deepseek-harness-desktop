@@ -36,10 +36,11 @@
 //                     back to execPath too.
 
 import { execFileSync, spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolvePnpmEntry, scanMissing, KNOWN_UNPUBLISHED } from './closure-check.mjs'
+import { findUnresolvableElf, pruneMuslBuilds } from './linuxdeploy.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)) // dsh-desktop/
 const args = parseArgs(process.argv.slice(2))
@@ -195,22 +196,24 @@ if (PLATFORMS[PLATFORM].trimDeepPaths) {
   }
 }
 
-// koffi's linux package ships BOTH glibc and musl .node builds
-// (glibc_x64/ + musl_x64/); the bundled glibc node never loads the musl one,
-// but linuxdeploy scans every ELF in the AppDir and hard-fails on the musl
-// build ("Could not find dependency: libc.musl-x86_64.so.1"). Drop it before
-// packing — only the Linux AppImage path is affected.
+// linuxdeploy scans every ELF in the AppDir and hard-fails the AppImage bundle
+// on musl builds. Only the Linux path is affected — see sidecar/linuxdeploy.mjs
+// for why the prune is structure-based and why it must run before packing.
 if (PLATFORM.startsWith('linux')) {
-  const koffiRoot = join(RUNTIME_OUT, 'node_modules', '@koromix')
-  if (existsSync(koffiRoot)) {
-    for (const pkg of readdirSync(koffiRoot).filter((n) => n.startsWith('koffi-linux-'))) {
-      const pkgDir = join(koffiRoot, pkg)
-      for (const sub of readdirSync(pkgDir)) {
-        if (sub.startsWith('musl_')) {
-          rmSync(join(pkgDir, sub), { recursive: true, force: true })
-          console.log(`  pruned ${join(pkgDir, sub)} (musl build; linuxdeploy)`)
-        }
-      }
+  for (const p of pruneMuslBuilds(RUNTIME_OUT)) {
+    console.log(`  pruned ${p} (musl build; linuxdeploy)`)
+  }
+  // Pre-flight the very check linuxdeploy is about to run, so a payload it
+  // cannot resolve is named here instead of surfacing as an opaque
+  // "Failed to run ldd: exited with code 1" 20 minutes into the job.
+  if (process.platform === 'linux') {
+    const bad = findUnresolvableElf(RUNTIME_OUT)
+    if (bad.length > 0) {
+      fail(
+        `linuxdeploy 会在下列文件上失败（ldd 非 0），AppImage 打包必然中断：\n` +
+          bad.map((b) => `  ${b.file}\n    ${b.why}`).join('\n') +
+          `\n  → musl/静态变体应由 pruneMuslBuilds 处理（见 sidecar/linuxdeploy.mjs）`,
+      )
     }
   }
 }
