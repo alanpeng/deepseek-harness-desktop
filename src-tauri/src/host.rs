@@ -7,7 +7,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +54,11 @@ pub struct HostState {
     pub web_url: Mutex<Option<String>>,
     /// Set when the user chose to quit; window close then exits instead of hiding.
     pub quitting: AtomicBool,
+    /// Set when the last `start_host` gave up (missing runtime, or 60 s without
+    /// a listener); cleared by every successful start. The boot self-heal reads
+    /// this instead of probing the port, so a host the user killed or one that
+    /// crashed mid-session never triggers an ~80 MB re-download.
+    pub start_failed: AtomicBool,
 }
 
 impl Default for HostState {
@@ -63,6 +68,7 @@ impl Default for HostState {
             child: Mutex::new(None),
             web_url: Mutex::new(None),
             quitting: AtomicBool::new(false),
+            start_failed: AtomicBool::new(false),
         }
     }
 }
@@ -240,7 +246,21 @@ fn parse_web_url_line(line: &str, port: u16) -> Option<String> {
 }
 
 /// Spawn the dsh web host and return its port once it is listening.
+///
+/// Also records the outcome in `HostState::start_failed`, which is what the
+/// boot self-heal keys off (see `updates::boot_self_heal`).
 pub fn start_host(app: &AppHandle) -> Result<u16, String> {
+    let result = start_host_inner(app);
+    app.state::<HostState>()
+        .start_failed
+        .store(result.is_err(), Ordering::SeqCst);
+    result
+}
+
+/// The actual spawn. Always called through `start_host` above, so that every
+/// `return Err` in here — missing dev bin, missing runtime, 60 s timeout —
+/// reaches `start_failed` without having to instrument each one.
+fn start_host_inner(app: &AppHandle) -> Result<u16, String> {
     let port = pick_free_port();
 
     // A previous process's announced URL must never leak into this launch —
@@ -402,6 +422,13 @@ pub fn start_host(app: &AppHandle) -> Result<u16, String> {
         ));
     }
     Ok(port)
+}
+
+/// True while a host child process is believed to be alive. `child` goes back
+/// to None both on teardown (kill_host) and on the sidecar's own Terminated
+/// event, so this is false after a failed start and after a mid-session crash.
+pub fn host_running(app: &AppHandle) -> bool {
+    app.state::<HostState>().child.lock().unwrap().is_some()
 }
 
 /// Kill the host and its whole child-process tree (shell tools spawn grandchildren).

@@ -83,6 +83,44 @@ fn staging_dir() -> PathBuf {
     cache.join("dsh-desktop").join("update-staging")
 }
 
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Boot self-heal throttle. A runtime that cannot be repaired would otherwise
+/// re-download ~80 MB on every single launch; one attempt per window is enough
+/// to converge once the channel is fixed, and cheap enough while it is not.
+const REPAIR_THROTTLE_SECS: u64 = 6 * 3600;
+
+/// Unix seconds of the last self-heal attempt, beside update-staging.
+fn repair_marker() -> PathBuf {
+    staging_dir().with_file_name("last-runtime-repair")
+}
+
+/// Pure predicate — `abs_diff` rather than `saturating_sub` so a marker
+/// stamped in the future (the clock moved back) ages out on its own instead of
+/// wedging the throttle open for as long as the skew lasts.
+fn repair_throttled(last: Option<u64>, now: u64) -> bool {
+    matches!(last, Some(t) if now.abs_diff(t) < REPAIR_THROTTLE_SECS)
+}
+
+/// False while the previous attempt is still inside the throttle window.
+pub(crate) fn repair_allowed() -> bool {
+    let last = std::fs::read_to_string(repair_marker())
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    !repair_throttled(last, now_unix())
+}
+
+/// Stamped *before* the attempt, not after: a crash partway through the
+/// download still has to count, or such a machine would retry on every launch.
+pub(crate) fn record_repair_attempt() {
+    let _ = std::fs::write(repair_marker(), now_unix().to_string());
+}
+
 /// Runtime version, read from the ACTIVE closure's package.json (the runtime
 /// dir passed in — bundle dir on Windows, bundle-or-overlay on Linux/macOS).
 pub fn bundled_dsh_version(runtime: &Path) -> Result<semver::Version, String> {
@@ -137,16 +175,52 @@ pub async fn check_runtime_update(app: &AppHandle) -> Result<Option<semver::Vers
 /// Download + verify + swap + restart host. Returns Err on any failure; the
 /// previous runtime is always restored unless the failure is pre-swap.
 pub async fn apply_runtime_update(app: &AppHandle, target: &semver::Version) -> Result<(), String> {
+    apply_with(app, target, OnBootFailure::RollBack).await
+}
+
+/// Re-install the runtime at `target` even though it equals the current
+/// version. `check_runtime_update` only ever yields a strictly greater version,
+/// so a machine sitting on a *broken* build of the newest version can never
+/// re-download it — that is the 2026-09-11 0.1.5-rc.2 incident, where every
+/// launch died at the 60 s timeout while cron and the manual check both
+/// reported "up to date". Driven by `updates::boot_self_heal`; `do_apply` has
+/// no version comparison of its own, so the same download/verify/swap path
+/// works unchanged.
+pub async fn reinstall_runtime(app: &AppHandle, target: &semver::Version) -> Result<(), String> {
+    apply_with(app, target, OnBootFailure::KeepNew).await
+}
+
+/// How to treat a runtime that installs cleanly but then fails to boot.
+#[derive(Clone, Copy)]
+enum OnBootFailure {
+    /// Normal update: put the previous runtime back — it is the one the user
+    /// was running, so it is the safest known state.
+    RollBack,
+    /// Boot self-heal: keep the freshly installed copy. We only get here
+    /// because the runtime being replaced already failed to boot, so restoring
+    /// it would restore a known-bad state and throw away a good download.
+    KeepNew,
+}
+
+async fn apply_with(
+    app: &AppHandle,
+    target: &semver::Version,
+    on_boot_failure: OnBootFailure,
+) -> Result<(), String> {
     let rstate = app.state::<RuntimeState>();
     if rstate.busy.swap(true, Ordering::SeqCst) {
         return Err("另一个运行时更新正在进行中".to_string());
     }
-    let result = do_apply(app, target).await;
+    let result = do_apply(app, target, on_boot_failure).await;
     rstate.busy.store(false, Ordering::SeqCst);
     result
 }
 
-async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), String> {
+async fn do_apply(
+    app: &AppHandle,
+    target: &semver::Version,
+    on_boot_failure: OnBootFailure,
+) -> Result<(), String> {
     // [1] fresh staging dir
     let staging = staging_dir();
     let _ = std::fs::remove_dir_all(&staging);
@@ -244,10 +318,7 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
 
     // [11] old → .bak (skipped on the first non-Windows update — no overlay
     // exists yet; the bundled runtime stays untouched)
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let ts = now_unix();
     let parent = install_dir.parent().unwrap_or(&install_dir);
     let bak = parent.join(format!("dsh-runtime.bak.{ts}"));
     if install_dir.exists() && rename_with_retry(&install_dir, &bak).is_err() {
@@ -282,14 +353,33 @@ async fn do_apply(app: &AppHandle, target: &semver::Version) -> Result<(), Strin
             updates::set_tray_status(app, &format!("Host: 运行中 · dsh v{target}"));
             Ok(())
         }
-        Err(e) => {
-            // [E4] host failed on the new runtime: full rollback
-            host::kill_host(app);
-            let _ = std::fs::remove_dir_all(&install_dir);
-            let _ = std::fs::rename(&bak, &install_dir);
-            let _ = host::restart_host(app);
-            Err(format!("新运行时启动失败，已回滚：{e}"))
-        }
+        Err(e) => match on_boot_failure {
+            OnBootFailure::RollBack => {
+                // [E4] host failed on the new runtime: full rollback
+                host::kill_host(app);
+                let _ = std::fs::remove_dir_all(&install_dir);
+                let _ = std::fs::rename(&bak, &install_dir);
+                // The rollback's own restart must not fail silently: saying
+                // "已回滚" while leaving the app with no host at all reads like
+                // a recovered state (2026-09-11 incident).
+                match host::restart_host(app) {
+                    Ok(_) => Err(format!("新运行时启动失败，已回滚：{e}")),
+                    Err(e2) => Err(format!(
+                        "新运行时启动失败，已回滚，但回滚后 Host 仍无法启动：{e2}\n（原始错误：{e}）"
+                    )),
+                }
+            }
+            // [E5] boot self-heal: the runtime we just replaced had already
+            // failed to boot (that is why we are here), so there is nothing
+            // worth rolling back to. Keep the new copy — a boot that failed
+            // for a transient reason then clears on the next launch instead of
+            // after another 80 MB download — and leave the old tree beside it
+            // for forensics.
+            OnBootFailure::KeepNew => Err(format!(
+                "自愈：重装 {target} 后 Host 仍无法启动：{e}\n旧运行时保留在 {}",
+                bak.display()
+            )),
+        },
     }
 }
 
@@ -543,5 +633,23 @@ mod tests {
             internal_version_matches(Path::new(&gz), &want)
                 .unwrap_or_else(|e| panic!("tarball internal version mismatch: {e}"));
         }
+    }
+
+    /// The self-heal must not re-download ~80 MB more than once per window.
+    #[test]
+    fn repair_throttle_window() {
+        const T: u64 = REPAIR_THROTTLE_SECS;
+        assert!(!repair_throttled(None, 1_000_000), "never tried → allowed");
+        assert!(repair_throttled(Some(1_000_000), 1_000_000), "just tried");
+        assert!(repair_throttled(Some(1_000_000), 1_000_000 + T - 1));
+        assert!(
+            !repair_throttled(Some(1_000_000), 1_000_000 + T),
+            "window elapsed → allowed again"
+        );
+        assert!(repair_throttled(Some(1_000_060), 1_000_000), "mild skew");
+        assert!(
+            !repair_throttled(Some(1_000_000 + 2 * T), 1_000_000),
+            "far-future marker ages out instead of wedging the throttle open"
+        );
     }
 }

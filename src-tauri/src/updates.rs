@@ -146,7 +146,12 @@ pub async fn check_all(app: AppHandle, manual: bool) {
                 apply_runtime(&app, &v, true).await;
             }
         }
-        Ok(None) => log("runtime up to date"),
+        Ok(None) => {
+            log("runtime up to date");
+            // "Nothing newer exists" is a dead end when the copy we hold is
+            // itself broken — see boot_self_heal below.
+            boot_self_heal(&app, manual).await;
+        }
         Err(e) => {
             log(&format!("runtime check failed: {e}"));
             if manual {
@@ -251,7 +256,69 @@ async fn apply_runtime(app: &AppHandle, v: &semver::Version, silent: bool) {
             if !silent {
                 info(app, "运行时更新失败", &e, MessageDialogKind::Error);
             }
-            set_tray_status(app, "Host: 运行中");
+            // Don't claim a healthy host: the rollback's own restart may have
+            // failed too, and the self-heal path deliberately leaves it down.
+            set_tray_status(
+                app,
+                if host::host_running(app) {
+                    "Host: 运行中"
+                } else {
+                    "Host: 未运行"
+                },
+            );
+        }
+    }
+}
+
+/// Last-resort repair for a host that will not start: re-install the runtime
+/// at the version we are already on.
+///
+/// `check_runtime_update` only ever yields a strictly greater version, so a
+/// machine holding a *broken* copy of the newest one can never re-download it.
+/// That is the 2026-09-11 incident: 0.1.5-rc.2 shipped a runtime whose entry
+/// point was a side-effect-only import, so it exited 0 without listening, every
+/// launch died at the 60 s timeout, and both cron and this very check kept
+/// reporting "up to date". Replacing the published asset cannot reach such a
+/// machine; re-installing the same version can.
+///
+/// Gated on the last start having actually failed — not merely on "no host" —
+/// so a host the user killed, or one that crashed mid-session, costs nothing.
+/// Never blocks startup: it rides the existing 15 s auto-check, and on success
+/// `do_apply` restarts the host and navigates the window off the error page.
+async fn boot_self_heal(app: &AppHandle, manual: bool) {
+    if !app
+        .state::<host::HostState>()
+        .start_failed
+        .load(Ordering::SeqCst)
+    {
+        return;
+    }
+    let Ok(cur) = runtime_update::bundled_dsh_version(&host::runtime_dir(app).unwrap_or_default())
+    else {
+        // Runtime dir too damaged to name a version — nothing to re-download.
+        log("boot self-heal skipped: bundled dsh version unreadable");
+        return;
+    };
+    if !runtime_update::repair_allowed() {
+        log("boot self-heal skipped: already attempted within the throttle window");
+        set_tray_status(app, "Host: 未运行 · 自愈已尝试，稍后自动重试");
+        return;
+    }
+    runtime_update::record_repair_attempt();
+    log(&format!(
+        "host failed to start; re-installing runtime {cur} (boot self-heal)"
+    ));
+    set_tray_status(app, "正在自愈运行时…（约 2 分钟）");
+    match runtime_update::reinstall_runtime(app, &cur).await {
+        Ok(()) => log(&format!(
+            "boot self-heal: runtime {cur} re-installed, host restarted"
+        )),
+        Err(e) => {
+            log(&format!("boot self-heal failed: {e}"));
+            set_tray_status(app, "Host: 未运行 · 托盘「检查更新…」可重试自愈");
+            if manual {
+                info(app, "运行时自愈失败", &e, MessageDialogKind::Error);
+            }
         }
     }
 }
