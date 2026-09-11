@@ -8,6 +8,8 @@
 #   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD / GH_PAT
 #
 # 手动运行：Actions → auto-update-dsh → Run workflow。
+#   默认只在版本落后或 artifacts 缺失时才构建；勾选 force 可对当前版本强制
+#   重建重发（产物存在但内容有问题时用，见 workflow_dispatch.inputs.force）。
 
 name: auto-update-dsh
 
@@ -15,7 +17,18 @@ on:
   schedule:
     # 每小时第 37 分（避开整点 cron 潮）；仓库 public，Actions 免费不限量
     - cron: '37 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      # 强制同版本重建。默认行为是"版本已最新且三平台 artifacts 齐全 → 早退"，
+      # 于是**产物存在但是坏的**这一情形无法用 dispatch 重发：0.1.5-rc.2 事故
+      # 即此——runtime 打得好好的，但入口 entry.mjs 在 0.1.5 上静默空转，客户端
+      # 每次启动都失败回滚，而 cron 与手动 dispatch 全都判定"无需更新"，把坏
+      # 资产一直挂在更新通道上。置 true 跳过该早退；重建时 release-runtime.mjs
+      # 复用已有 release、删旧资产重传，版本号与 tag 均不变，客户端无需改配置。
+      force:
+        description: '忽略"artifacts 齐全"早退，强制重建当前版本'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -47,6 +60,8 @@ jobs:
           # GITHUB_TOKEN 作用域仅限本仓库，跨仓库 API 一律 401（即使目标
           # public）→ 曾致每小时误判缺失、反复 rebuild rc.7。
           GH_PAT: ${{ secrets.GH_PAT }}
+          # schedule 事件下 inputs 为空 → 求值为空串，等价 false
+          FORCE: ${{ inputs.force }}
         run: |
           LATEST="$(npm view @deepseek-ai/dsh versions --json | node -e '
             const vs = JSON.parse(require("fs").readFileSync(0, "utf8"))
@@ -82,11 +97,15 @@ jobs:
                 "https://api.github.com/repos/alanpeng/deepseek-harness-runtime/releases/tags/dsh-runtime-$LATEST-$PLAT")
               if [ "$CODE" != "200" ]; then echo "  $PLAT: HTTP $CODE"; MISSING="$MISSING $PLAT"; fi
             done
-            if [ -z "$MISSING" ]; then
+            if [ -z "$MISSING" ] && [ "$FORCE" != "true" ]; then
               echo "已是 $LATEST 且 runtime artifacts 齐全，无需更新"
               exit 0
             fi
-            echo "已是 $LATEST 但 runtime artifacts 缺失（$MISSING），重新构建发布"
+            if [ -n "$MISSING" ]; then
+              echo "已是 $LATEST 但 runtime artifacts 缺失（$MISSING），重新构建发布"
+            else
+              echo "强制重建 $LATEST（force=true）：artifacts 齐全但按请求重发"
+            fi
           else
             echo "发现新版 $LATEST（当前 $CUR），开始 bump…"
           fi
