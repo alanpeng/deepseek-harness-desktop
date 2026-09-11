@@ -40,7 +40,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'n
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolvePnpmEntry, scanMissing, KNOWN_UNPUBLISHED } from './closure-check.mjs'
-import { findUnresolvableElf, pruneMuslBuilds } from './linuxdeploy.mjs'
+import { findUnresolvableElf, pruneForeignBuilds } from './linuxdeploy.mjs'
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url)) // dsh-desktop/
 const args = parseArgs(process.argv.slice(2))
@@ -197,11 +197,12 @@ if (PLATFORMS[PLATFORM].trimDeepPaths) {
 }
 
 // linuxdeploy scans every ELF in the AppDir and hard-fails the AppImage bundle
-// on musl builds. Only the Linux path is affected — see sidecar/linuxdeploy.mjs
-// for why the prune is structure-based and why it must run before packing.
+// on the ones ldd cannot read (musl builds, other architectures). Only the
+// Linux path is affected — see sidecar/linuxdeploy.mjs for why the prune is
+// structure-based and why it must run before packing.
 if (PLATFORM.startsWith('linux')) {
-  for (const p of pruneMuslBuilds(RUNTIME_OUT)) {
-    console.log(`  pruned ${p} (musl build; linuxdeploy)`)
+  for (const { path, why } of pruneForeignBuilds(RUNTIME_OUT, { arch: PLATFORM.split('-')[1] })) {
+    console.log(`  pruned ${path} (${why}; linuxdeploy)`)
   }
   // Pre-flight the very check linuxdeploy is about to run, so a payload it
   // cannot resolve is named here instead of surfacing as an opaque
